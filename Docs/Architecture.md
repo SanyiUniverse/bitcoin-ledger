@@ -4,6 +4,10 @@ Bitcoin Ledger 是本机单用户账本。没有服务器、账号、CloudKit、
 
 主窗口默认 1100 × 800，内容最小尺寸由 900 × 680 降至 600 × 420，使用 `.windowResizability(.contentMinSize)`，不设置应用级最大尺寸。内容区域宽度低于 650 时，`GeometryReader` 配合 Apple `AnyLayout` 在 `HStackLayout` / `VStackLayout` 间切换，卡片改为纵排；列表日期和账户余额允许换行。继续使用原生 SwiftUI，不增加布局依赖。
 
+操作面板使用 SwiftUI `overlay`，由父窗口可用尺寸限定宽高，不扩大父布局。面板标题和底部按钮固定，表单内容单独滚动。所有子页显式接收 `onDismiss`；取消、右上角 ×、Esc 和应用内面板外点击均直接丢弃未保存草稿，保存动作只有写入成功后才关闭。错误提示保留当前编辑状态。
+
+面板出现时禁用背景交互并从无障碍导航隐藏背景；工具栏及独立于视图树的备份菜单命令也按同一状态禁用。`FocusState` 将初始输入焦点送到金额或名称字段，关闭后回到侧栏。该方案只使用 Apple 原生布局、控件与焦点 API，不增加依赖。
+
 ## 本地持久化
 
 本项目使用 `Codable` + `JSONEncoder`/`JSONDecoder`，账本位于 `~/Library/Application Support/Bitcoin Ledger/ledger.json`。BTC 使用 `Int64` satoshi，人民币与价格使用规范十进制字符串；计算才转换为 Foundation `Decimal`。JSON 结构含 `schemaVersion`，读入时拒绝不支持的版本和无效账目。

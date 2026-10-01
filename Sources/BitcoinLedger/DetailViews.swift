@@ -65,8 +65,7 @@ struct AccountsView: View {
 
 struct EntryDetail: View {
     @EnvironmentObject private var store: AppStore
-    @Environment(\.dismiss) private var dismiss
-    let entry: LedgerEntry; let onEdit: () -> Void
+    let entry: LedgerEntry; let onEdit: () -> Void; let onDismiss: () -> Void
     @State private var confirmDelete = false
     @State private var error: String?
     private var valuation: EntryValuation? { store.valuation(for: entry) }
@@ -75,8 +74,8 @@ struct EntryDetail: View {
     }
     private var hasFee: Bool { entry.feeSats > 0 || entry.feeCNY > 0 || entry.feeUSDT > 0 }
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            Label(title, systemImage: entry.kind.icon).font(.title2.weight(.semibold))
+        VStack(alignment: .leading, spacing: 0) {
+            PanelHeader(title: title, onClose: onDismiss)
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     VStack(spacing: 14) {
@@ -118,20 +117,29 @@ struct EntryDetail: View {
                             .padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
                     }
                 }
-                .padding(.trailing, 4)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
             }
-            if let error { Text(error).foregroundStyle(.red) }
+            .frame(minHeight: 0, maxHeight: .infinity)
+            Divider()
             HStack {
                 Button("删除记录", role: .destructive) { confirmDelete = true }
                 Spacer()
-                Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("关闭", action: onDismiss)
                 Button("编辑", action: onEdit).buttonStyle(.borderedProminent)
             }
-        }.padding(28).frame(width: 650, height: 640)
+            .controlSize(.large).padding(20)
+            .fixedSize(horizontal: false, vertical: true)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
         .confirmationDialog("删除这条记录？所有余额和成本将重新计算。", isPresented: $confirmDelete) {
             Button("删除", role: .destructive) {
-                do { try store.deleteEntry(entry); dismiss() } catch { self.error = error.localizedDescription }
+                do { try store.deleteEntry(entry); onDismiss() } catch { self.error = error.localizedDescription }
             }
+        }
+        .alert("未能删除记录", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+            Button("好", role: .cancel) { error = nil }
+        } message: {
+            Text(error ?? "")
         }
     }
 
@@ -194,10 +202,10 @@ struct EntryDetail: View {
 }
 
 struct RulesView: View {
-    @Environment(\.dismiss) private var dismiss
+    let onDismiss: () -> Void
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("账目计算规则").font(.title2.weight(.semibold))
+        VStack(alignment: .leading, spacing: 0) {
+            PanelHeader(title: "账目计算规则", onClose: onDismiss)
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     rule("按真实现金本金记账", "这里追踪实际投入人民币、实际收回人民币，以及尚由 BTC 和 USDT 承接的本金。它是个人现金本金账本，不是税务核算，也不会按交易时的市场价重置本金。")
@@ -211,10 +219,14 @@ struct RulesView: View {
                     rule("每次修改都重新计算", "记录按日期时间、同时间录入顺序重算。编辑、删除或导入若会导致任一时点 BTC 账户或 USDT 余额不足，就不保存。BTC 精确到 1 satoshi，USDT 与人民币采用十进制数。原有人民币直接买卖 BTC 的记录仍可查看和编辑。")
                     rule("本地数据与备份", "账本仅保存在此 Mac 的 Application Support/Bitcoin Ledger 中。每次保存保留上一版；JSON 是可完整恢复的备份，CSV 供查看交易明细。导出的备份是明文，请存放在你信任的位置。")
                     rule("参考价格", "BTC 人民币参考行情来自 Blockchain.com；显示成功获取时间，该 API 不提供成交时间。网络失败继续显示缓存。参考行情只用于 BTC 市值和浮动盈亏，不改变任何原始本金。")
-                }.padding(.trailing, 8)
+                }.padding(.horizontal, 20).padding(.vertical, 12)
             }
-            HStack { Spacer(); Button("好") { dismiss() }.keyboardShortcut(.defaultAction) }
-        }.padding(28).frame(width: 650, height: 670)
+            .frame(minHeight: 0, maxHeight: .infinity)
+            Divider()
+            HStack { Spacer(); Button("好", action: onDismiss).keyboardShortcut(.defaultAction) }
+                .controlSize(.large).padding(20)
+                .fixedSize(horizontal: false, vertical: true)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
     private func rule(_ title: String, _ text: String) -> some View {
         VStack(alignment: .leading, spacing: 6) { Text(title).font(.headline); Text(text).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }

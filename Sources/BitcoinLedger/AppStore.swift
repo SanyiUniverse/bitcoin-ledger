@@ -12,6 +12,7 @@ final class AppStore: ObservableObject {
     @Published var message: String?
     @Published var priceError: String?
     @Published var refreshing = false
+    @Published var isPresentingPanel = false
     private var lastAttempt: Date?
     private let repository: LedgerRepository?
 

@@ -37,6 +37,10 @@ Apple 文档同时提供 `.md` 版本；Decimal 官方内容已读取，确认�
 
 窗口缩放补充核验：Apple [`WindowResizability.contentMinSize`](https://developer.apple.com/documentation/swiftui/windowresizability/contentminsize) 以内容最小尺寸约束窗口，不施加最大尺寸；[`AnyLayout`](https://developer.apple.com/documentation/swiftui/anylayout) 可切换横排和纵排布局。两者均支持 macOS 13 及以上，覆盖本项目最低 macOS 14。采用这些原生能力，将主窗口最小尺寸从 900 × 680 调整为 600 × 420，默认仍为 1100 × 800；内容区低于 650 时纵排卡片，并让列表日期和账户余额换行，无需第三方布局库。
 
+操作面板补充核验：系统 [sheet](https://developer.apple.com/design/human-interface-guidelines/sheets) 提供模态隔离，但已核验的公开 API 没有点击父窗口空白直接取消的开关；[popover](https://developer.apple.com/design/human-interface-guidelines/popovers) 支持外部关闭，主要用于依附控件的少量内容。本项目采用原生 [`overlay`](https://developer.apple.com/documentation/swiftui/view/overlay(alignment:content:))，让父视图主导布局，并自行提供面板外点击取消；面板随可用窗口尺寸调整，标题和底栏固定、内容滚动。取消、×、Esc 和外部空白点击均按用户要求放弃草稿；保存成功才入账关闭，错误提示后仍可继续编辑。
+
+Apple [`keyboardShortcut`](https://developer.apple.com/documentation/swiftui/view/keyboardshortcut(_:)) 会在窗口和菜单命令中查找目标，因此面板开启时同时禁用背景、工具栏与备份菜单，不能只拦截鼠标。使用 [`FocusState`](https://developer.apple.com/documentation/swiftui/focusstate) 将初始焦点送入金额或名称，关闭后回侧栏；背景另从无障碍导航隐藏。这些能力均由 SwiftUI 提供，没有新增依赖。
+
 ## 本地持久化选择
 
 首选项已经调查 [SwiftData](https://developer.apple.com/documentation/swiftdata)。当前 Mac 只有可用的 Command Line Tools 环境，实际编译探针发现 SwiftData 的宏支持不可用；为了让交付物在这台 Mac 立即可构建、可运行，V1 使用 Foundation Codable 与原子 JSON 文件保存，而不是安装重量级工具链或引入第三方数据库。

@@ -3,9 +3,11 @@ import LedgerCore
 
 struct EntryEditor: View {
     @EnvironmentObject private var store: AppStore
-    @Environment(\.dismiss) private var dismiss
     let kind: EntryKind
     let existing: LedgerEntry?
+    let onDismiss: () -> Void
+    private enum Field: Hashable { case primary, fee }
+    @FocusState private var focusedField: Field?
     @State private var entryID = UUID()
     @State private var date = Date()
     @State private var from: UUID?
@@ -56,14 +58,16 @@ struct EntryEditor: View {
 
     var body: some View {
         if kind == .adjustUSDT {
-            USDTAdjustmentEditor(existing: existing)
+            USDTAdjustmentEditor(existing: existing, onDismiss: onDismiss)
         } else {
             transactionForm
         }
     }
     private var transactionForm: some View {
         VStack(spacing: 0) {
-            HStack { Text(existing == nil ? kind.title : "编辑\(kind.title)").font(.title2.weight(.semibold)); Spacer() }.padding(24)
+            PanelHeader(title: existing == nil ? kind.title : "编辑\(kind.title)", onClose: onDismiss)
+                .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
+            Divider()
             Form {
                 Section {
                     DatePicker("日期时间", selection: $date, in: ...Date(), displayedComponents: [.date, .hourAndMinute])
@@ -83,23 +87,23 @@ struct EntryEditor: View {
                 Section {
                     switch kind {
                     case .buyUSDT:
-                        TextField("实际支付人民币 ¥（含人民币手续费）", text: $cny)
+                        TextField("实际支付人民币 ¥（含人民币手续费）", text: $cny).focused($focusedField, equals: .primary)
                         TextField("实际到账 USDT（已扣 USDT 手续费）", text: $usdt)
                         Text("按实际支出建立人民币成本，USDT 统一记在一个余额中。").font(.caption).foregroundStyle(.secondary)
                     case .sellUSDT:
-                        TextField("扣除 USDT 总量（含 USDT 手续费）", text: $usdt)
+                        TextField("扣除 USDT 总量（含 USDT 手续费）", text: $usdt).focused($focusedField, equals: .primary)
                         TextField("实际到账人民币 ¥（已扣人民币手续费）", text: $cny)
                         Text("本次净回款减去扣除 USDT 对应的本金，就是人民币兑现盈亏。").font(.caption).foregroundStyle(.secondary)
                     case .buy:
                         if settlement == .usdt {
-                            TextField("扣除 USDT 总量（含 USDT 手续费）", text: $usdt)
+                            TextField("扣除 USDT 总量（含 USDT 手续费）", text: $usdt).focused($focusedField, equals: .primary)
                             Text("人民币成本按当时 USDT 余额的平均成本自动分摊，不重复增加投入。").font(.caption).foregroundStyle(.secondary)
                         } else {
-                            TextField("购币金额 ¥（不含人民币手续费）", text: $cny)
+                            TextField("购币金额 ¥（不含人民币手续费）", text: $cny).focused($focusedField, equals: .primary)
                         }
                         TextField("实际获得 BTC（已扣 BTC 手续费）", text: $btc)
                     case .sell:
-                        TextField("卖出 / 花费 BTC（不含额外 BTC 手续费）", text: $btc)
+                        TextField("卖出 / 花费 BTC（不含额外 BTC 手续费）", text: $btc).focused($focusedField, equals: .primary)
                         if settlement == .usdt {
                             TextField("实际到账 USDT（已扣 USDT 手续费）", text: $usdt)
                             Text("原人民币本金转入到账 USDT，此时不确认人民币兑现收益。").font(.caption).foregroundStyle(.secondary)
@@ -108,7 +112,7 @@ struct EntryEditor: View {
                             Text("直接花费 BTC 时，到账人民币填 0；该笔本金计入已实现损失。").font(.caption).foregroundStyle(.secondary)
                         }
                     case .transfer:
-                        TextField("转出 BTC（账户实际扣除总量）", text: $btc)
+                        TextField("转出 BTC（账户实际扣除总量）", text: $btc).focused($focusedField, equals: .primary)
                         TextField("实际到账 BTC", text: $received)
                         LabeledContent("BTC 差额 / 手续费", value: transferFee.map { "\(Display.btc($0)) BTC" } ?? "—")
                         Text("到账部分只移动位置；BTC 手续费减少数量，不减少原本金。额外人民币手续费计入成本。").font(.caption).foregroundStyle(.secondary)
@@ -123,7 +127,7 @@ struct EntryEditor: View {
                         ForEach(allowedFees, id: \.self) { Text($0.title).tag($0) }
                     }.pickerStyle(.segmented)
                     if kind != .transfer || feeCurrency != .btc {
-                        TextField("手续费 \(feeCurrency.title)", text: $fee)
+                        TextField("手续费 \(feeCurrency.title)", text: $fee).focused($focusedField, equals: .fee)
                     }
                     if btcFeeIsPositive {
                         Picker("人民币折算依据", selection: $feeSource) {
@@ -160,17 +164,24 @@ struct EntryEditor: View {
                         }
                     }
                 }
-                Section { TextField("备注（可选）", text: $note, axis: .vertical).lineLimit(2...4) }
-            }.formStyle(.grouped)
-            if let error { Text(error).foregroundStyle(.red).font(.callout).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24).padding(.bottom, 12).textSelection(.enabled) }
+                Section {
+                    TextField("备注（可选）", text: $note, axis: .vertical).lineLimit(2...4)
+                    Text("BTC / USDT 最多 8 位小数 · 人民币最多 2 位").font(.caption).foregroundStyle(.secondary)
+                }
+            }.formStyle(.grouped).frame(minHeight: 0, maxHeight: .infinity)
+            Divider()
             HStack {
-                Text("BTC / USDT 最多 8 位小数 · 人民币最多 2 位").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("取消", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("保存") { save() }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
-            }.padding(20)
-        }.frame(width: 680, height: 760)
+                Button("取消", action: onDismiss).accessibilityIdentifier("panel.cancel")
+                Button("保存记录") { save() }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(!store.canEdit).accessibilityIdentifier("panel.save")
+            }.controlSize(.large).padding(.horizontal, 20).padding(.vertical, 14)
+                .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        .alert("无法保存记录", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+            Button("好", role: .cancel) { error = nil }
+        } message: { Text(error ?? "") }
         .onAppear { load() }
+        .task { await Task.yield(); focusedField = kind == .fee ? .fee : .primary }
         .onChange(of: settlement) { _, _ in
             if !allowedFees.contains(feeCurrency) { feeCurrency = .btc; fee = "" }
         }
@@ -239,15 +250,16 @@ struct EntryEditor: View {
                            feeUSDT: feeUSDT, feeValuationSource: source)
     }
     private func save() {
-        do { try store.saveEntry(makeEntry()); dismiss() }
+        do { try store.saveEntry(makeEntry()); onDismiss() }
         catch { self.error = error.localizedDescription }
     }
 }
 
 struct USDTAdjustmentEditor: View {
     @EnvironmentObject private var store: AppStore
-    @Environment(\.dismiss) private var dismiss
     let existing: LedgerEntry?
+    let onDismiss: () -> Void
+    @FocusState private var balanceFocused: Bool
     @State private var entryID = UUID()
     @State private var date = Date()
     @State private var actualBalance = ""
@@ -265,15 +277,14 @@ struct USDTAdjustmentEditor: View {
     private var preview: (entry: LedgerEntry, valuation: EntryValuation)? { try? draft() }
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text(existing == nil ? "修改 USDT 余额" : "编辑 USDT 余额调整").font(.title2.weight(.semibold))
-                Spacer()
-            }.padding(24)
+            PanelHeader(title: existing == nil ? "修改 USDT 余额" : "编辑 USDT 余额调整", onClose: onDismiss)
+                .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
+            Divider()
             Form {
                 Section {
                     LabeledContent("记录时间", value: date.formatted(date: .numeric, time: .shortened))
                     LabeledContent("调整前账面余额", value: "\(Display.usdt(bookBalance)) USDT")
-                    TextField("实际 USDT 余额", text: $actualBalance)
+                    TextField("实际 USDT 余额", text: $actualBalance).focused($balanceFocused)
                     Text("填入交易所实际显示的余额，例如收到手续费返还后的数量。差额会单独记录，保留之前的买卖记录。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -298,22 +309,23 @@ struct USDTAdjustmentEditor: View {
                         Text("保留原记录时间。修改后会重新核对后续余额和成本；历史余额不足时不会保存。")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    Text("最多 8 位小数 · 调整会保存在历史记录中").font(.caption).foregroundStyle(.secondary)
                 }
-            }.formStyle(.grouped)
-            if let error {
-                Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24).padding(.bottom, 12)
-            }
+            }.formStyle(.grouped).frame(minHeight: 0, maxHeight: .infinity)
+            Divider()
             HStack {
-                Text("最多 8 位小数 · 调整会保存在历史记录中").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("取消", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("保存") {
-                    do { let prepared = try draft(); try store.saveEntry(prepared.entry); dismiss() }
+                Button("取消", action: onDismiss).accessibilityIdentifier("panel.cancel")
+                Button("保存记录") {
+                    do { let prepared = try draft(); try store.saveEntry(prepared.entry); onDismiss() }
                     catch { self.error = error.localizedDescription }
-                }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(!store.canEdit)
-            }.padding(20)
-        }.frame(width: 650, height: 600)
+                }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(!store.canEdit).accessibilityIdentifier("panel.save")
+            }.controlSize(.large).padding(.horizontal, 20).padding(.vertical, 14)
+                .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        .alert("无法保存余额调整", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+            Button("好", role: .cancel) { error = nil }
+        } message: { Text(error ?? "") }
         .onAppear {
             if let existing {
                 entryID = existing.id; date = existing.date
@@ -322,32 +334,50 @@ struct USDTAdjustmentEditor: View {
                 actualBalance = Display.usdt(store.snapshot?.usdtBalance ?? 0)
             }
         }
+        .task { await Task.yield(); balanceFocused = true }
     }
 }
 
 struct AccountEditor: View {
     @EnvironmentObject private var store: AppStore
-    @Environment(\.dismiss) private var dismiss
     let existing: Account?
+    let onDismiss: () -> Void
+    @FocusState private var nameFocused: Bool
     @State private var name = ""
     @State private var kind: AccountKind = .exchange
     @State private var error: String?
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text(existing == nil ? "添加账户" : "重命名账户").font(.title2.weight(.semibold))
+        VStack(spacing: 0) {
+            PanelHeader(title: existing == nil ? "添加账户" : "重命名账户", onClose: onDismiss)
+                .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
+            Divider()
             Form {
-                TextField("账户名称", text: $name)
-                Picker("账户类型", selection: $kind) { ForEach(AccountKind.allCases, id: \.self) { Text($0.title).tag($0) } }
-                    .disabled(existing != nil)
-            }
-            Text("只记录名称和余额，不需要地址、私钥、助记词或交易所权限。").font(.caption).foregroundStyle(.secondary)
-            if let error { Text(error).foregroundStyle(.red) }
-            HStack { Spacer(); Button("取消") { dismiss() }.keyboardShortcut(.cancelAction); Button("保存") {
-                do {
-                    try store.saveAccount(Account(id: existing?.id ?? UUID(), name: name.trimmingCharacters(in: .whitespacesAndNewlines), kind: kind))
-                    dismiss()
-                } catch { self.error = error.localizedDescription }
-            }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent) }
-        }.padding(28).frame(width: 470).onAppear { if let existing { name = existing.name; kind = existing.kind } }
+                Section {
+                    TextField("账户名称", text: $name).focused($nameFocused)
+                    Picker("账户类型", selection: $kind) { ForEach(AccountKind.allCases, id: \.self) { Text($0.title).tag($0) } }
+                        .disabled(existing != nil)
+                }
+                Section {
+                    Text("只记录名称和余额，不需要地址、私钥、助记词或交易所权限。").font(.caption).foregroundStyle(.secondary)
+                }
+            }.formStyle(.grouped).frame(minHeight: 0, maxHeight: .infinity)
+            Divider()
+            HStack {
+                Spacer()
+                Button("取消", action: onDismiss).accessibilityIdentifier("panel.cancel")
+                Button("保存账户") {
+                    do {
+                        try store.saveAccount(Account(id: existing?.id ?? UUID(), name: name.trimmingCharacters(in: .whitespacesAndNewlines), kind: kind))
+                        onDismiss()
+                    } catch { self.error = error.localizedDescription }
+                }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(!store.canEdit).accessibilityIdentifier("panel.save")
+            }.controlSize(.large).padding(.horizontal, 20).padding(.vertical, 14)
+                .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        .alert("无法保存账户", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+            Button("好", role: .cancel) { error = nil }
+        } message: { Text(error ?? "") }
+        .onAppear { if let existing { name = existing.name; kind = existing.kind } }
+        .task { await Task.yield(); nameFocused = true }
     }
 }

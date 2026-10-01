@@ -17,6 +17,8 @@
 
 主窗口默认 1100 × 800，可拖动边缘缩放，最小 600 × 420；应用不设置最大尺寸。内容区域变窄时，卡片自动纵向排列，列表日期和账户余额可换行。
 
+操作面板随可用窗口大小调整，内容可滚动，标题和底部「取消／保存」固定可见。点击「取消」、右上角 ×、按 Esc，或点击应用内面板外的空白，都会直接放弃未保存输入。点击保存后，只有成功写入账本才关闭；出错时保留输入和编辑面板，关闭错误提示后可继续修改。面板打开期间，背景页面、工具栏和备份菜单暂停操作；输入焦点先进入金额或名称，关闭后回到侧栏。
+
 ## 技术与运行
 
 - Swift 6、SwiftUI、AppKit 系统文件面板、Foundation、URLSession、Swift Testing。
@@ -28,8 +30,11 @@
 
 ```sh
 ./Scripts/test.sh
+./Scripts/test-panels.sh
 ./Scripts/build-app.sh
 ```
+
+`test-panels.sh` 在独立临时账本和测试自有窗口中检查生产面板布局、取消、保存及背景点击，不操作正式账本；结束后清理测试源副本、图片和构建缓存。需要留图时可设置 `PANEL_QA_ARTIFACTS`。这项检查不等同于已安装应用的系统鼠标键盘端到端测试。
 
 构建脚本输出项目旁的 `Bitcoin Ledger.zip`，其中包含已完成本机签名的原生应用。`./Scripts/build-app.sh --install` 可同时安装到 `/Applications/Bitcoin Ledger.app`；已有同名应用时会保留原应用并停止安装。本机交付已安装好，日常使用无需终端。因为本机 Documents 文件提供器会给裸 `.app` 添加导致严格签名校验失败的 FinderInfo，完整应用以 ZIP 作为归档，并从「应用程序」运行。当前机器的默认 SDK27 缺少 SwiftUIMacros，脚本自动选择已安装的稳定 SDK26.5，不更改系统设置。可用 `BITCOIN_LEDGER_SDK` 指定其它兼容 SDK。在完整 Xcode 中也可打开 `Package.swift` 查看、修改和运行源码；打包使用上述脚本。
 

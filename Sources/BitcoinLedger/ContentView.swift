@@ -6,19 +6,15 @@ enum Page: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var icon: String { switch self { case .dashboard: "square.grid.2x2"; case .usdt: "arrow.left.arrow.right.circle"; case .sales: "arrow.up.right.circle"; case .history: "clock"; case .accounts: "wallet.bifold" } }
 }
-struct EntrySheet: Identifiable { let id = UUID(); var kind: EntryKind; var entry: LedgerEntry? }
-struct AccountSheet: Identifiable { let id = UUID(); var account: Account? }
-
 struct ContentView: View {
     @EnvironmentObject private var store: AppStore
     @State private var page: Page? = .dashboard
-    @State private var entrySheet: EntrySheet?
-    @State private var accountSheet: AccountSheet?
-    @State private var selectedEntry: LedgerEntry?
-    @State private var showRules = false
+    @State private var panel: LedgerPanel?
+    @FocusState private var navigationFocused: Bool
     var body: some View {
         NavigationSplitView {
             List(Page.allCases, selection: $page) { page in Label(page.rawValue, systemImage: page.icon).tag(page) }
+                .focused($navigationFocused)
                 .navigationSplitViewColumnWidth(min: 160, ideal: 185, max: 220)
                 .safeAreaInset(edge: .bottom) {
                     VStack(alignment: .leading, spacing: 5) {
@@ -34,47 +30,61 @@ struct ContentView: View {
                     } description: { Text(error) } actions: { Button("Import Backup…") { store.importJSON() } }
                 } else {
                     switch page ?? .dashboard {
-                    case .dashboard: DashboardView(onAddAccount: { accountSheet = AccountSheet() }, onAdd: { entrySheet = EntrySheet(kind: $0) })
-                    case .usdt: USDTView(onAdd: { entrySheet = EntrySheet(kind: $0) }, onEntry: { selectedEntry = $0 })
-                    case .sales: SalesView(onAddAccount: { accountSheet = AccountSheet() }, onAdd: { entrySheet = EntrySheet(kind: $0) }, onEntry: { selectedEntry = $0 })
-                    case .history: HistoryView(entries: store.entries, onEntry: { selectedEntry = $0 })
-                    case .accounts: AccountsView(onAdd: { accountSheet = AccountSheet() }, onEdit: { accountSheet = AccountSheet(account: $0) }, onEntry: { selectedEntry = $0 })
+                    case .dashboard: DashboardView(onAddAccount: { present(.account(nil)) }, onAdd: { present(.entry($0, nil)) })
+                    case .usdt: USDTView(onAdd: { present(.entry($0, nil)) }, onEntry: { present(.detail($0)) })
+                    case .sales: SalesView(onAddAccount: { present(.account(nil)) }, onAdd: { present(.entry($0, nil)) }, onEntry: { present(.detail($0)) })
+                    case .history: HistoryView(entries: store.entries, onEntry: { present(.detail($0)) })
+                    case .accounts: AccountsView(onAdd: { present(.account(nil)) }, onEdit: { present(.account($0)) }, onEntry: { present(.detail($0)) })
                     }
                 }
             }
             .navigationTitle((page ?? .dashboard).rawValue)
             .toolbar {
                 ToolbarItemGroup {
-                    Button { showRules = true } label: { Image(systemName: "info.circle") }.help("计算规则")
+                    Button { present(.rules) } label: { Image(systemName: "info.circle") }.help("计算规则").disabled(panel != nil)
                     Menu {
                         Button("Export Backup · JSON…") { store.exportJSON() }.disabled(!store.canEdit)
                         Button("导出交易历史 · CSV…") { store.exportCSV() }.disabled(!store.canEdit)
                         Divider()
                         Button("Import Backup…") { store.importJSON() }
                     } label: { Label("备份", systemImage: "square.and.arrow.up") }
+                    .disabled(panel != nil)
                     Menu {
                         ForEach(EntryKind.allCases, id: \.self) { kind in
-                            Button { entrySheet = EntrySheet(kind: kind) } label: { Label(kind.title, systemImage: kind.icon) }
+                            Button { present(.entry(kind, nil)) } label: { Label(kind.title, systemImage: kind.icon) }
                                 .disabled(store.accounts.isEmpty && (kind == .buy || kind == .transfer || kind == .sell))
                         }
                     } label: { Label("新增记录", systemImage: "plus") }
-                    .disabled(!store.canEdit)
+                    .disabled(!store.canEdit || panel != nil)
                     .help("新增人民币、USDT 或 BTC 账目")
                 }
             }
         }
-        .sheet(item: $entrySheet) { item in EntryEditor(kind: item.kind, existing: item.entry).environmentObject(store) }
-        .sheet(item: $accountSheet) { item in AccountEditor(existing: item.account).environmentObject(store) }
-        .sheet(item: $selectedEntry) { entry in
-            EntryDetail(entry: entry, onEdit: {
-                selectedEntry = nil
-                entrySheet = EntrySheet(kind: entry.kind, entry: entry)
-            }).environmentObject(store)
+        .disabled(panel != nil)
+        .allowsHitTesting(panel == nil)
+        .accessibilityHidden(panel != nil)
+        .overlay {
+            if let panel {
+                LedgerPanelOverlay(panel: panel, onDismiss: dismissPanel,
+                                   onEdit: { present(.entry($0.kind, $0)) })
+                    .environmentObject(store)
+            }
         }
-        .sheet(isPresented: $showRules) { RulesView() }
+        .onDisappear { store.isPresentingPanel = false }
         .alert("Bitcoin Ledger", isPresented: Binding(get: { store.message != nil }, set: { if !$0 { store.message = nil } })) {
             Button("好", role: .cancel) { store.message = nil }
         } message: { Text(store.message ?? "") }
+    }
+
+    private func present(_ destination: LedgerPanel.Destination) {
+        navigationFocused = false
+        panel = LedgerPanel(destination: destination)
+        store.isPresentingPanel = true
+    }
+    private func dismissPanel() {
+        panel = nil
+        store.isPresentingPanel = false
+        navigationFocused = true
     }
 }
 

@@ -16,7 +16,7 @@ V1 使用 `Codable` + `JSONEncoder`/`JSONDecoder`，账本位于 `~/Library/Appl
 
 SwiftPM 管理 `LedgerCore`、`BitcoinLedger` 和 Swift Testing 测试三个 target。最低部署版本 macOS 14；本次交付为当前 Mac 的 Apple Silicon 架构。本机默认 SDK 指向 27.0，但 CLT 缺少其新 `SwiftUIMacros` 插件；构建脚本在存在时采用已安装的 26.5 SDK，未修改系统开发环境设置，也未使用新于部署版本的 API。
 
-`Scripts/build-app.sh` 用系统 Swift 编译器创建 release executable，按 Apple 标准 `Contents/MacOS`、`Contents/Resources`、`Info.plist` 组装 `.app`，然后使用本机 ad-hoc 签名并校验。这适合此 Mac 个人使用；向其他 Mac 分发时需单独决定 Developer ID 签名和公证。完整 Xcode 不是本机运行交付物的依赖。
+`Scripts/build-app.sh` 用系统 Swift 编译器创建 release executable，按 Apple 标准 `Contents/MacOS`、`Contents/Resources`、`Info.plist` 组装 `.app`，然后使用本机 ad-hoc 签名并校验。此 Mac 的 Documents 文件提供器会持续给 `.app` 根目录添加 FinderInfo，导致严格签名校验失败。因此在系统临时目录签名，以 `Bitcoin Ledger.zip` 保存完整应用；`--install` 参数安装到 `/Applications/Bitcoin Ledger.app`，避免该文件提供器干扰。这适合此 Mac 个人使用；向其他 Mac 分发时需单独决定 Developer ID 签名和公证。完整 Xcode 不是本机运行交付物的依赖。
 
 ## 官方依据
 

@@ -6,7 +6,7 @@
 
 ## 日常使用
 
-1. 双击 **Bitcoin Ledger.app**。
+1. 在「应用程序」或 Spotlight 打开 **Bitcoin Ledger**。本机安装位置为 `/Applications/Bitcoin Ledger.app`。
 2. 在「账户」添加自己的交易所或自托管钱包。
 3. 点击右上角 `＋` 输入记录。买入填**实际到账 BTC**；转账填源账户实际扣除总量和目标实到账，手续费自动算出。
 4. 使用工具栏「备份 → Export Backup · JSON」定期保存完整备份；CSV 用于查看交易明细。
@@ -27,7 +27,7 @@
 ./Scripts/build-app.sh
 ```
 
-构建脚本输出项目旁的 `Bitcoin Ledger.app`，无需终端即可日常使用。当前机器的默认 SDK27 缺少 SwiftUIMacros，脚本自动选择已安装的稳定 SDK26.5，不更改系统设置。可用 `BITCOIN_LEDGER_SDK` 指定其它兼容 SDK。在完整 Xcode 中也可打开 `Package.swift` 查看、修改和运行源码；打包使用上述脚本。
+构建脚本输出项目旁的 `Bitcoin Ledger.zip`，其中包含已完成本机签名的原生应用。`./Scripts/build-app.sh --install` 可同时安装到 `/Applications/Bitcoin Ledger.app`；已有同名应用时会保留原应用并停止安装。本机交付已安装好，日常使用无需终端。因为本机 Documents 文件提供器会给裸 `.app` 添加导致严格签名校验失败的 FinderInfo，完整应用以 ZIP 作为归档，并从「应用程序」运行。当前机器的默认 SDK27 缺少 SwiftUIMacros，脚本自动选择已安装的稳定 SDK26.5，不更改系统设置。可用 `BITCOIN_LEDGER_SDK` 指定其它兼容 SDK。在完整 Xcode 中也可打开 `Package.swift` 查看、修改和运行源码；打包使用上述脚本。
 
 ## 数据模型
 

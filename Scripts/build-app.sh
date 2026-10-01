@@ -14,7 +14,11 @@ else
 fi
 swift build --sdk "$LEDGER_SDK" -c release --product BitcoinLedger
 LEDGER_BIN_DIR="$(swift build --sdk "$LEDGER_SDK" -c release --show-bin-path)"
-APP_DIR="$PROJECT_DIR/../Bitcoin Ledger.app"
+# Build the signed bundle outside Documents: File Provider attaches FinderInfo
+# there immediately, which Apple's strict signature verification rejects.
+PACKAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bitcoin-ledger-package.XXXXXX")"
+trap 'rm -r "$PACKAGE_DIR"' EXIT
+APP_DIR="$PACKAGE_DIR/Bitcoin Ledger.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$LEDGER_BIN_DIR/BitcoinLedger" "$APP_DIR/Contents/MacOS/BitcoinLedger"
 cp Resources/Info.plist "$APP_DIR/Contents/Info.plist"
@@ -22,20 +26,21 @@ if [ -f Resources/AppIcon.icns ]; then
     cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi
 chmod 755 "$APP_DIR/Contents/MacOS/BitcoinLedger"
-# Finder/File Provider may attach FinderInfo in Documents. Only clean metadata
-# on the app bundle created by this script, never the user's source/data files.
+# Only clean metadata on the app bundle this script has just created.
 xattr -dr com.apple.FinderInfo "$APP_DIR" 2>/dev/null || true
 xattr -dr com.apple.ResourceFork "$APP_DIR" 2>/dev/null || true
 codesign --force --sign - "$APP_DIR"
 codesign --verify --strict "$APP_DIR"
 plutil -lint "$APP_DIR/Contents/Info.plist"
-printf 'Built: %s\n' "$APP_DIR"
+ARCHIVE_PATH="$PROJECT_DIR/../Bitcoin Ledger.zip"
+ditto -c -k --keepParent --norsrc --noextattr "$APP_DIR" "$ARCHIVE_PATH"
+printf 'Built: %s\n' "$ARCHIVE_PATH"
 if [ "${1:-}" = "--install" ]; then
-    mkdir -p "$HOME/Applications"
-    if [ -e "$HOME/Applications/Bitcoin Ledger.app" ]; then
+    if [ -e "/Applications/Bitcoin Ledger.app" ]; then
         printf 'Existing installed app retained. Quit it and replace it manually in Finder.\n' >&2
         exit 1
     fi
-    ditto "$APP_DIR" "$HOME/Applications/Bitcoin Ledger.app"
-    codesign --verify --strict "$HOME/Applications/Bitcoin Ledger.app"
+    ditto --norsrc --noextattr "$APP_DIR" "/Applications/Bitcoin Ledger.app"
+    codesign --verify --strict "/Applications/Bitcoin Ledger.app"
+    printf 'Installed: %s\n' "/Applications/Bitcoin Ledger.app"
 fi

@@ -143,24 +143,11 @@ struct DashboardView: View {
                         }
                         if let error = store.priceError { Text(error).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
                     }.padding(24).background(.background, in: RoundedRectangle(cornerRadius: 16))
-                    VStack(spacing: 10) {
-                        HStack(spacing: 16) {
-                            LedgerActionButton(title: "买入 USDT", detail: "记录实际投入的人民币", icon: "arrow.down.circle") { onAdd(.buyUSDT) }
-                            LedgerActionButton(title: "买入 BTC", detail: store.accounts.isEmpty ? "先添加一个 BTC 账户" : "使用 USDT 或人民币购入", icon: "bitcoinsign.circle") {
-                                if store.accounts.isEmpty { onAddAccount() } else { onAdd(.buy) }
-                            }
+                    HStack(spacing: 16) {
+                        LedgerActionButton(title: "买入 USDT", detail: "记录实际投入的人民币", icon: "arrow.down.circle") { onAdd(.buyUSDT) }
+                        LedgerActionButton(title: "买入 BTC", detail: store.accounts.isEmpty ? "先添加一个 BTC 账户" : "使用 USDT 或人民币购入", icon: "bitcoinsign.circle") {
+                            if store.accounts.isEmpty { onAddAccount() } else { onAdd(.buy) }
                         }
-                        HStack(spacing: 12) {
-                            Button { if store.accounts.isEmpty { onAddAccount() } else { onAdd(.transfer) } } label: {
-                                Label("转账", systemImage: "arrow.left.arrow.right").frame(maxWidth: .infinity, minHeight: 32)
-                            }
-                            Button { if store.accounts.isEmpty { onAddAccount() } else { onAdd(.sell) } } label: {
-                                Label("卖出 BTC", systemImage: "arrow.up.right").frame(maxWidth: .infinity, minHeight: 32)
-                            }
-                            Button { onAdd(.fee) } label: {
-                                Label("其他手续费", systemImage: "minus.circle").frame(maxWidth: .infinity, minHeight: 32)
-                            }
-                        }.buttonStyle(.bordered).controlSize(.large)
                     }.disabled(!store.canEdit)
                     HStack(spacing: 16) {
                         MetricCard(title: "BTC 持仓本金", value: Display.money(state.costBasisCNY), detail: "每 BTC 实际成本 \(Display.money(state.actualCostPriceCNY))")

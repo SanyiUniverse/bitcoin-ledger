@@ -12,13 +12,17 @@ Bitcoin Ledger 是本机单用户账本。没有服务器、账号、CloudKit、
 
 读取失败会报告错误并保留原文件，不静默建立空账本覆盖原数据。显式从备份恢复时，可在保留损坏字节为 `ledger.corrupt-UUID.json` 后恢复。导入前的有效账本另外保存为 `ledger.before-import-UUID.json`，不会被后续日常保存覆盖。已读取文件若在其他进程被改动，保存会拒绝覆盖，要求重新打开应用。持久化测试覆盖重新打开、权限、无效保存、上一版本备份、损坏检测、恢复和并发覆盖。
 
-## V2 的最小扩展
+## 成本池与余额调整的最小扩展
 
 继续复用原生 Decimal、Codable、NSFileCoordinator、SwiftUI 表单和导航。未引入库、新数据库、USDT 行情 API 或汇率服务；人民币成本来自真实现金和交易原值，不从实时汇率猜测。Foundation Decimal 和 NSDecimalRound 官方接口于本次升级再次核对。
 
-`LedgerEntry` 增加 buyUSDT / sellUSDT 两种事件、BTC 买卖结算币种、USDT 数量与费用估价来源。旧字段原样兼容。`LedgerSnapshot` 增加单一 USDT 成本池、累计回款和逐笔 EntryValuation。业务逻辑仍只有一个完整重放引擎，不复制到 UI。
+`LedgerEntry` 在原有 BTC 事件上增加 buyUSDT / sellUSDT / adjustUSDT、BTC 买卖结算币种、USDT 数量与费用估价来源。`LedgerSnapshot` 提供单一 USDT 成本池、累计回款和逐笔 EntryValuation。业务逻辑仍只有一个完整重放引擎，不复制到 UI。首页只保留「买入比特币」「转移比特币」两个主要操作；USDT 买入和修改余额位于 USDT 页面。
 
-备份版本 2 固定 `baseCurrency = CNY` 和 `accountingPolicy = cny-principal-moving-average-v1`，序列化派生快照前重算，恢复时核验。Repository 在首次覆盖旧版前先保存原始字节；已有账本遭外部修改时拒绝覆盖。详细口径见 Accounting.md。
+`adjustUSDT` 是可编辑、可重放的余额目标事件。原始 `amountUSDT` 保存首次录入时的账面参考值，`receivedUSDT` 保存目标值；EntryValuation 的 `beforeUSDT` / `afterUSDT` 保存实际重放前后数量，前序记录修改后重新计算，不覆盖原始参考值。正目标保留池内人民币本金，零目标核销剩余本金并计入已兑盈亏；两者都不改变累计投入、回款、BTC 或已记手续费。详细口径见 Accounting.md。
+
+备份版本 3 固定 `baseCurrency = CNY` 和 `accountingPolicy = cny-principal-moving-average-v1`，在原成本口径中扩展余额目标规则。序列化派生快照前重算，恢复时核验。版本 1 / 2 可读入并升级为内存版本 3；不会虚构 USDT 或余额调整记录。版本 2 / 3 必须保留完整 USDT 原始字段及逐笔估值；旧估值没有调整前后字段时仍可恢复。版本 1 / 2 不允许包含 adjustUSDT，避免旧版本标签掩盖新增语义。
+
+读取旧版不改写文件。Repository 首次保存升级前，在确认文件未被外部改动后，将旧文件原始字节独立保留为 `ledger.before-upgrade-v1-UUID.json` 或 `ledger.before-upgrade-v2-UUID.json`，成功保留后才写入版本 3；后续日常保存不会覆盖这些文件。
 
 ## 构建与发布
 

@@ -55,6 +55,13 @@ struct EntryEditor: View {
     }
 
     var body: some View {
+        if kind == .adjustUSDT {
+            USDTAdjustmentEditor(existing: existing)
+        } else {
+            transactionForm
+        }
+    }
+    private var transactionForm: some View {
         VStack(spacing: 0) {
             HStack { Text(existing == nil ? kind.title : "编辑\(kind.title)").font(.title2.weight(.semibold)); Spacer() }.padding(24)
             Form {
@@ -105,6 +112,8 @@ struct EntryEditor: View {
                         TextField("实际到账 BTC", text: $received)
                         LabeledContent("BTC 差额 / 手续费", value: transferFee.map { "\(Display.btc($0)) BTC" } ?? "—")
                         Text("到账部分只移动位置；BTC 手续费减少数量，不减少原本金。额外人民币手续费计入成本。").font(.caption).foregroundStyle(.secondary)
+                    case .adjustUSDT:
+                        EmptyView() // Routed to the dedicated balance editor above.
                     case .fee:
                         Text("费用按原币记录。BTC / USDT 费用由同币种剩余余额承担成本；全部耗尽时确认成本损失。").font(.caption).foregroundStyle(.secondary)
                     }
@@ -232,6 +241,87 @@ struct EntryEditor: View {
     private func save() {
         do { try store.saveEntry(makeEntry()); dismiss() }
         catch { self.error = error.localizedDescription }
+    }
+}
+
+struct USDTAdjustmentEditor: View {
+    @EnvironmentObject private var store: AppStore
+    @Environment(\.dismiss) private var dismiss
+    let existing: LedgerEntry?
+    @State private var entryID = UUID()
+    @State private var date = Date()
+    @State private var actualBalance = ""
+    @State private var note = ""
+    @State private var error: String?
+
+    private var bookBalance: Decimal {
+        if let existing, let before = store.valuation(for: existing)?.beforeUSDT { return before }
+        return store.snapshot?.usdtBalance ?? 0
+    }
+    private func draft() throws -> (entry: LedgerEntry, valuation: EntryValuation) {
+        let target = try Amounts.decimal(actualBalance, maxPlaces: 8)
+        return try store.prepareUSDTAdjustment(to: target, note: note, existing: existing, id: entryID, date: date)
+    }
+    private var preview: (entry: LedgerEntry, valuation: EntryValuation)? { try? draft() }
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(existing == nil ? "修改 USDT 余额" : "编辑 USDT 余额调整").font(.title2.weight(.semibold))
+                Spacer()
+            }.padding(24)
+            Form {
+                Section {
+                    LabeledContent("记录时间", value: date.formatted(date: .numeric, time: .shortened))
+                    LabeledContent("调整前账面余额", value: "\(Display.usdt(bookBalance)) USDT")
+                    TextField("实际 USDT 余额", text: $actualBalance)
+                    Text("填入交易所实际显示的余额，例如收到手续费返还后的数量。差额会单独记录，保留之前的买卖记录。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let preview, let before = preview.valuation.beforeUSDT, let after = preview.valuation.afterUSDT {
+                    Section("本次调整") {
+                        let delta = after - before
+                        LabeledContent("自动计算差额", value: "\(delta > 0 ? "+" : "")\(Display.usdt(delta)) USDT")
+                        LabeledContent("调整后人民币成本", value: Display.money(after > 0 ? preview.valuation.costCNY : 0))
+                        if after > 0 {
+                            LabeledContent("调整后每 USDT 平均成本", value: Display.money(Amounts.rounded(preview.valuation.costCNY / after)))
+                            Text("保留原人民币成本，不增加投入或回款，也不冲减已记录的手续费。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else if preview.valuation.costCNY > 0 {
+                            Text("余额清零会将剩余 \(Display.money(preview.valuation.costCNY)) 本金计为调整损失，不产生人民币回款。")
+                                .font(.callout).foregroundStyle(.orange)
+                        }
+                    }
+                }
+                Section {
+                    TextField("备注（可选，例如手续费返还）", text: $note, axis: .vertical).lineLimit(2...3)
+                    if existing != nil {
+                        Text("保留原记录时间。修改后会重新核对后续余额和成本；历史余额不足时不会保存。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }.formStyle(.grouped)
+            if let error {
+                Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24).padding(.bottom, 12)
+            }
+            HStack {
+                Text("最多 8 位小数 · 调整会保存在历史记录中").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("取消", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("保存") {
+                    do { let prepared = try draft(); try store.saveEntry(prepared.entry); dismiss() }
+                    catch { self.error = error.localizedDescription }
+                }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(!store.canEdit)
+            }.padding(20)
+        }.frame(width: 650, height: 600)
+        .onAppear {
+            if let existing {
+                entryID = existing.id; date = existing.date
+                actualBalance = Display.usdt(existing.receivedUSDT); note = existing.note
+            } else {
+                actualBalance = Display.usdt(store.snapshot?.usdtBalance ?? 0)
+            }
+        }
     }
 }
 

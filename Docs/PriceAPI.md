@@ -1,6 +1,6 @@
 # 行情 API 决策
 
-核验日期：2026-10-01。V1 使用 Apple Foundation / URLSession，第三方依赖为零。
+核验日期：2026-10-01。使用 Apple Foundation / URLSession，第三方依赖为零。
 
 ## 选择：Blockchain.com Exchange Rates
 
@@ -17,14 +17,16 @@
 
 [官方 Keyless 文档](https://docs.coingecko.com/docs/keyless-public-api) 明确允许免注册免 Key，动态共享 IP 配额约 10–30 次/分钟，同时说明不适合生产负载、计划轮询或高频更新。实测 `/api/v3/simple/price?ids=bitcoin&vs_currencies=cny&include_last_updated_at=true&precision=full` 返回 HTTP 200。
 
-[Simple Price 文档](https://docs.coingecko.com/reference/simple-price) 提供 `last_updated_at`，但上述使用条件不适合作为长期自动刷新主来源。因此 V1 不增加第二套自动行情依赖，也不引入 Key、账号或额外费用。
+[Simple Price 文档](https://docs.coingecko.com/reference/simple-price) 提供 `last_updated_at`，但上述使用条件不适合作为长期自动刷新主来源。因此未增加第二套自动行情依赖，也不引入 Key、账号或额外费用。
 
 ## 费用快照与实时价格分开
 
-费用始终保留原币数量。手工历史 BTC/CNY 价格作为固定快照保留；V2 还支持按成本链自动估算 BTC / USDT 费用，并明确标为成本折算，不冒充历史行情。编辑前序账目重算成本折算值，手工历史价格不变；实时行情只用于当前 BTC 市值。
+费用始终保留原币数量。手工历史 BTC/CNY 价格作为固定快照保留；按成本链自动估算的 BTC / USDT 费用明确标为成本折算，不冒充历史行情。编辑前序账目重算成本折算值，手工历史价格不变；实时行情只用于当前 BTC 市值。USDT 余额调整不依赖行情或汇率 API，也不冲减之前已记录的手续费。
 
 ## 备份与 CSV
 
-JSON schemaVersion 为 2，含固定 CNY 本位和现金本金口径，兼容版本 1 并在首次写回前自动保留原始字节；金额为十进制字符串、BTC 数量为整数 satoshi、日期为 Unix epoch 毫秒（保留小数毫秒，不截断交易顺序）。使用 Foundation Codable，不引入 JSON 或 CSV 库。导入最大 20 MiB，先完整解码和重放验证，版本不支持、缺失账户、重复 ID 或透支等错误不得改变现有数据。
+JSON schemaVersion 为 3，含固定 CNY 本位和现金本金口径，兼容版本 1 / 2。读取不改写旧文件，首次保存升级前先确认没有外部修改，再将原始字节保留为独立的 `ledger.before-upgrade-v1-UUID.json` 或 `ledger.before-upgrade-v2-UUID.json`。金额为十进制字符串、BTC 数量为整数 satoshi、日期为 Unix epoch 毫秒（保留小数毫秒，不截断交易顺序）。使用 Foundation Codable，不引入 JSON 或 CSV 库。导入最大 20 MiB，先完整解码和重放验证，版本不支持、缺失账户、重复 ID 或透支等错误不得改变现有数据。
 
-CSV 使用 RFC 4180 引号转义、CRLF 换行、UTF-8 BOM。导出完整时间、账户 ID/名称/类型、所有整数 satoshi、人民币金额、USDT 扣款/到账/费用、费用换算来源、逐笔人民币本金、费用单价与等值。自由文本若可能触发表格公式，前置单引号；原文完整保存在 JSON 备份。CSV 用于查看和携出，JSON 用于恢复。
+余额调整同时保留原始 `amountUSDT` 参考值、`receivedUSDT` 目标值，以及重放得到的 `beforeUSDT` / `afterUSDT`。前序历史变化时只重算派生估值，不覆盖原始审计字段；正目标保留原成本，零目标核销剩余成本，不改变外部现金流。
+
+CSV 使用 RFC 4180 引号转义、CRLF 换行、UTF-8 BOM。导出完整时间、账户 ID/名称/类型、所有整数 satoshi、人民币金额、USDT 扣款/到账/费用、费用换算来源、逐笔人民币本金、费用单价与等值。调整行另有 `adjustment_before_usdt`、`adjustment_after_usdt`、`adjustment_delta_usdt` 三列，均使用实际重放结果，其余行留空。自由文本若可能触发表格公式，前置单引号；原文完整保存在 JSON 备份。CSV 用于查看和携出，JSON 用于恢复。

@@ -1,7 +1,7 @@
 import Foundation
 
 public struct BackupDocument: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
     public static let supportedAccountingPolicy = "cny-principal-moving-average-v1"
     public var schemaVersion: Int
     public var baseCurrency: String
@@ -11,7 +11,7 @@ public struct BackupDocument: Codable, Equatable, Sendable {
     public var entries: [LedgerEntry]
     public var lastPrice: PriceQuote?
 
-    public init(schemaVersion: Int = 2, exportedAt: Date = Date(), accounts: [Account] = [], entries: [LedgerEntry] = [], lastPrice: PriceQuote? = nil,
+    public init(schemaVersion: Int = BackupDocument.currentSchemaVersion, exportedAt: Date = Date(), accounts: [Account] = [], entries: [LedgerEntry] = [], lastPrice: PriceQuote? = nil,
                 baseCurrency: String = "CNY", accountingPolicy: String = BackupDocument.supportedAccountingPolicy) {
         self.schemaVersion = schemaVersion
         self.baseCurrency = baseCurrency
@@ -37,7 +37,7 @@ public struct BackupDocument: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         let originalVersion = try values.decode(Int.self, forKey: .schemaVersion)
-        guard originalVersion == 1 || originalVersion == Self.currentSchemaVersion else {
+        guard (1...Self.currentSchemaVersion).contains(originalVersion) else {
             throw BackupError.unsupportedSchema(originalVersion)
         }
         if originalVersion == 1 {
@@ -51,7 +51,7 @@ public struct BackupDocument: Codable, Equatable, Sendable {
         schemaVersion = Self.currentSchemaVersion
         exportedAt = try values.decode(Date.self, forKey: .exportedAt)
         accounts = try values.decode([Account].self, forKey: .accounts)
-        if originalVersion == Self.currentSchemaVersion {
+        if originalVersion >= 2 {
             // Entry decoding has legacy defaults for v1 only. A v2 document
             // must explicitly state its settlement/fee semantics, even at zero.
             _ = try values.decode([RequiredV2EntryFields].self, forKey: .entries)
@@ -68,8 +68,11 @@ public struct BackupDocument: Codable, Equatable, Sendable {
                     && $0.feeCurrency != .usdt && $0.feeValuationSource == .manualPrice
             }) else { throw BackupError.invalidDocument("版本 1 不能包含 USDT 或新的费用估值口径。") }
         }
+        if originalVersion == 2, entries.contains(where: { $0.kind == .adjustUSDT }) {
+            throw BackupError.invalidDocument("版本 2 不能包含 USDT 余额校正记录。")
+        }
         let replay = try BackupCodec.validatedSnapshot(self)
-        if originalVersion == Self.currentSchemaVersion {
+        if originalVersion >= 2 {
             let stored = try values.decode([String: EntryValuation].self, forKey: .entryValuations)
             var parsed: [UUID: EntryValuation] = [:]
             for (key, value) in stored {
@@ -131,15 +134,15 @@ public enum BackupCodec {
         let version: Int
         do { version = try JSONDecoder().decode(VersionHeader.self, from: data).schemaVersion }
         catch { throw BackupError.invalidDocument("JSON 备份版本信息不正确。") }
-        guard version == 1 || version == BackupDocument.currentSchemaVersion else {
+        guard (1...BackupDocument.currentSchemaVersion).contains(version) else {
             throw BackupError.unsupportedSchema(version)
         }
         let header: Header
         do { header = try JSONDecoder().decode(Header.self, from: data) }
         catch { throw BackupError.invalidDocument("JSON 备份头信息不正确。") }
-        if header.schemaVersion == 2 {
+        if header.schemaVersion >= 2 {
             guard let base = header.baseCurrency, let policy = header.accountingPolicy else {
-                throw BackupError.invalidDocument("版本 2 缺少本位币或记账口径。")
+                throw BackupError.invalidDocument("版本 \(header.schemaVersion) 缺少本位币或记账口径。")
             }
             try validatePolicy(baseCurrency: base, accountingPolicy: policy)
         } else {
@@ -212,7 +215,7 @@ public enum BackupCodec {
     public static func csv(accounts: [Account], entries: [LedgerEntry]) throws -> Data {
         let replay = try LedgerEngine.calculate(accounts: accounts, entries: entries)
         let accountMap = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0) })
-        var rows = [["id", "date_utc", "sequence", "kind", "from_account_id", "from_account_name", "from_account_type", "to_account_id", "to_account_name", "to_account_type", "amount_sats", "amount_btc", "received_sats", "received_btc", "amount_cny", "fee_currency", "fee_sats", "fee_btc", "fee_cny", "fee_price_cny_per_btc", "fee_cny_equivalent", "fee_category", "note", "settlement_currency", "amount_usdt", "received_usdt", "fee_usdt", "fee_valuation_source", "entry_cost_cny", "fee_unit_cost_cny", "base_currency", "accounting_policy"]]
+        var rows = [["id", "date_utc", "sequence", "kind", "from_account_id", "from_account_name", "from_account_type", "to_account_id", "to_account_name", "to_account_type", "amount_sats", "amount_btc", "received_sats", "received_btc", "amount_cny", "fee_currency", "fee_sats", "fee_btc", "fee_cny", "fee_price_cny_per_btc", "fee_cny_equivalent", "fee_category", "note", "settlement_currency", "amount_usdt", "received_usdt", "fee_usdt", "fee_valuation_source", "entry_cost_cny", "fee_unit_cost_cny", "base_currency", "accounting_policy", "adjustment_before_usdt", "adjustment_after_usdt", "adjustment_delta_usdt"]]
         for entry in entries.sorted(by: {
             if $0.date != $1.date { return $0.date < $1.date }
             if $0.sequence != $1.sequence { return $0.sequence < $1.sequence }
@@ -224,6 +227,13 @@ public enum BackupCodec {
                 throw BackupError.invalidDocument("缺少逐笔人民币成本快照。")
             }
             let feeEquivalent = valuation.feeCNYEquivalent
+            var adjustmentColumns = ["", "", ""]
+            if entry.kind == .adjustUSDT {
+                guard let before = valuation.beforeUSDT, let after = valuation.afterUSDT else {
+                    throw BackupError.invalidDocument("余额校正记录缺少重放前后数量。")
+                }
+                adjustmentColumns = [decimalString(before), decimalString(after), decimalString(after - before)]
+            }
             rows.append([
                 entry.id.uuidString, timestamp(entry.date), String(entry.sequence), entry.kind.rawValue,
                 entry.fromAccountID?.uuidString ?? "", safeText(from?.name ?? ""), from?.kind.rawValue ?? "",
@@ -237,7 +247,7 @@ public enum BackupCodec {
                 decimalString(entry.amountUSDT), decimalString(entry.receivedUSDT), decimalString(entry.feeUSDT),
                 entry.feeValuationSource.rawValue, decimalString(valuation.costCNY), decimalString(valuation.feeUnitCostCNY),
                 "CNY", BackupDocument.supportedAccountingPolicy
-            ])
+            ] + adjustmentColumns)
         }
         let csv = "\u{FEFF}" + rows.map { $0.map(escapeCSV).joined(separator: ",") }.joined(separator: "\r\n") + "\r\n"
         return Data(csv.utf8)

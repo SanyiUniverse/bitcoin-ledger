@@ -144,9 +144,11 @@ struct DashboardView: View {
                         if let error = store.priceError { Text(error).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
                     }.padding(24).background(.background, in: RoundedRectangle(cornerRadius: 16))
                     HStack(spacing: 16) {
-                        LedgerActionButton(title: "买入 USDT", detail: "记录实际投入的人民币", icon: "arrow.down.circle") { onAdd(.buyUSDT) }
-                        LedgerActionButton(title: "买入 BTC", detail: store.accounts.isEmpty ? "先添加一个 BTC 账户" : "使用 USDT 或人民币购入", icon: "bitcoinsign.circle") {
+                        LedgerActionButton(title: "买入比特币", detail: store.accounts.isEmpty ? "先添加一个 BTC 账户" : "使用 USDT 或人民币购入", icon: "bitcoinsign.circle") {
                             if store.accounts.isEmpty { onAddAccount() } else { onAdd(.buy) }
+                        }
+                        LedgerActionButton(title: "转移比特币", detail: store.accounts.isEmpty ? "先添加一个 BTC 账户" : "在交易所和自托管钱包间转移", icon: "arrow.left.arrow.right.circle") {
+                            if store.accounts.isEmpty { onAddAccount() } else { onAdd(.transfer) }
                         }
                     }.disabled(!store.canEdit)
                     HStack(spacing: 16) {
@@ -187,7 +189,7 @@ struct SalesView: View {
                 if let state = store.snapshot {
                     HStack(spacing: 16) {
                         MetricCard(title: "累计人民币回款", value: Display.money(state.returnedCNY), detail: "卖出 BTC 或 USDT 后实际收回的人民币")
-                        MetricCard(title: "已兑人民币盈亏", value: Display.money(state.realizedPnLCNY), detail: "人民币回款 − 本金；含消费及费用耗尽损失")
+                        MetricCard(title: "已兑人民币盈亏", value: Display.money(state.realizedPnLCNY), detail: "人民币回款 − 本金；含消费、费用耗尽及余额清零损失")
                     }
                     HStack(spacing: 16) {
                         LedgerActionButton(title: "卖出 BTC", detail: store.accounts.isEmpty ? "先添加一个 BTC 账户" : "记录收到的 USDT 或人民币", icon: "arrow.up.right.circle") {
@@ -195,7 +197,7 @@ struct SalesView: View {
                         }
                         LedgerActionButton(title: "USDT 换回人民币", detail: "记录 USDT 扣款与人民币实收", icon: "yensign.circle") { onAdd(.sellUSDT) }
                     }.disabled(!store.canEdit)
-                    Text("BTC 卖回 USDT 时继续保留原人民币本金；换回人民币后才确认该笔兑现盈亏。直接花费 BTC 和费用耗尽余额时，相应本金计入损失。")
+                    Text("BTC 卖回 USDT 时继续保留原人民币本金；换回人民币后才确认该笔兑现盈亏。直接花费 BTC、费用耗尽余额或手动清零 USDT 时，相应本金计入损失。")
                         .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     if entries.isEmpty {
                         ContentUnavailableView("还没有卖出记录", systemImage: "arrow.up.right.circle", description: Text("卖出 BTC 或把 USDT 换回人民币后，记录会显示在这里。"))
@@ -219,7 +221,7 @@ struct USDTView: View {
     let onAdd: (EntryKind) -> Void
     let onEntry: (LedgerEntry) -> Void
     private var entries: [LedgerEntry] {
-        store.entries.filter { $0.kind == .buyUSDT || $0.kind == .sellUSDT || $0.settlementCurrency == .usdt || $0.feeCurrency == .usdt }
+        store.entries.filter { $0.kind == .buyUSDT || $0.kind == .sellUSDT || $0.kind == .adjustUSDT || $0.settlementCurrency == .usdt || $0.feeCurrency == .usdt }
     }
     var body: some View {
         ScrollView {
@@ -227,9 +229,15 @@ struct USDTView: View {
                 if let state = store.snapshot {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("USDT 周转余额").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                        HStack(alignment: .firstTextBaseline, spacing: 10) {
-                            Text(Display.usdt(state.usdtBalance)).font(.system(size: 40, weight: .semibold, design: .rounded)).monospacedDigit()
-                            Text("USDT").font(.title3).foregroundStyle(.secondary)
+                        HStack {
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                Text(Display.usdt(state.usdtBalance)).font(.system(size: 40, weight: .semibold, design: .rounded)).monospacedDigit()
+                                Text("USDT").font(.title3).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("修改余额", systemImage: "pencil") { onAdd(.adjustUSDT) }
+                                .buttonStyle(.bordered).controlSize(.large).disabled(!store.canEdit)
+                                .help("按实际 USDT 余额校准，并保留一条调整记录")
                         }
                         Text("记录人民币与 BTC 之间的周转资金。").foregroundStyle(.secondary)
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(24).background(.background, in: RoundedRectangle(cornerRadius: 16))
@@ -306,28 +314,40 @@ struct EntryRow: View {
         case .transfer: "\(store.accountName(entry.fromAccountID)) → \(store.accountName(entry.toAccountID))"
         case .buyUSDT: "人民币 → USDT"
         case .sellUSDT: "USDT → 人民币"
+        case .adjustUSDT: "USDT 周转余额"
         case .fee:
             entry.feeCurrency == .usdt ? "USDT 周转资金" : entry.fromAccountID == nil ? "人民币费用" : store.accountName(entry.fromAccountID)
         }
     }
     private var quantity: String {
         switch entry.kind {
-        case .buy: "+\(Display.btc(entry.amountSats)) BTC"
-        case .sell: "−\(Display.btc(entry.amountSats)) BTC"
-        case .transfer: "\(Display.btc(entry.amountSats)) BTC"
-        case .fee: "−\(Display.fee(entry))"
-        case .buyUSDT: "+\(Display.usdt(entry.receivedUSDT)) USDT"
-        case .sellUSDT: "−\(Display.usdt(entry.amountUSDT)) USDT"
+        case .buy: return "+\(Display.btc(entry.amountSats)) BTC"
+        case .sell: return "−\(Display.btc(entry.amountSats)) BTC"
+        case .transfer: return "\(Display.btc(entry.amountSats)) BTC"
+        case .fee: return "−\(Display.fee(entry))"
+        case .buyUSDT: return "+\(Display.usdt(entry.receivedUSDT)) USDT"
+        case .sellUSDT: return "−\(Display.usdt(entry.amountUSDT)) USDT"
+        case .adjustUSDT:
+            if let valuation = store.valuation(for: entry), let before = valuation.beforeUSDT, let after = valuation.afterUSDT {
+                let change = after - before
+                return "\(change > 0 ? "+" : change < 0 ? "−" : "")\(Display.usdt(change < 0 ? -change : change)) USDT"
+            }
+            return "— USDT"
         }
     }
     private var settlement: String? {
         switch entry.kind {
-        case .buy: entry.settlementCurrency == .usdt ? "支出 \(Display.usdt(entry.amountUSDT)) USDT" : "购币 \(Display.money(entry.amountCNY))"
-        case .sell: entry.settlementCurrency == .usdt ? "实收 \(Display.usdt(entry.receivedUSDT)) USDT" : "实收 \(Display.money(entry.amountCNY))"
-        case .buyUSDT: "支出 \(Display.money(entry.amountCNY))"
-        case .sellUSDT: "实收 \(Display.money(entry.amountCNY))"
-        case .transfer: "到账 \(Display.btc(entry.receivedSats)) BTC"
-        case .fee: nil
+        case .buy: return entry.settlementCurrency == .usdt ? "支出 \(Display.usdt(entry.amountUSDT)) USDT" : "购币 \(Display.money(entry.amountCNY))"
+        case .sell: return entry.settlementCurrency == .usdt ? "实收 \(Display.usdt(entry.receivedUSDT)) USDT" : "实收 \(Display.money(entry.amountCNY))"
+        case .buyUSDT: return "支出 \(Display.money(entry.amountCNY))"
+        case .sellUSDT: return "实收 \(Display.money(entry.amountCNY))"
+        case .adjustUSDT:
+            if let valuation = store.valuation(for: entry), let before = valuation.beforeUSDT, let after = valuation.afterUSDT {
+                return "\(Display.usdt(before)) → \(Display.usdt(after)) USDT"
+            }
+            return nil
+        case .transfer: return "到账 \(Display.btc(entry.receivedSats)) BTC"
+        case .fee: return nil
         }
     }
     private var principal: String? {
@@ -337,6 +357,7 @@ struct EntryRow: View {
         case .sell, .sellUSDT: return "移出本金 \(Display.money(valuation.costCNY))"
         case .transfer: return "转出本金 \(Display.money(valuation.costCNY))"
         case .fee: return "费用折合 \(Display.money(valuation.feeCNYEquivalent))"
+        case .adjustUSDT: return "\(entry.receivedUSDT > 0 ? "保留本金" : "核销本金") \(Display.money(valuation.costCNY))"
         }
     }
     var body: some View {
@@ -360,7 +381,7 @@ struct EntryRow: View {
 struct HistoryView: View {
     let entries: [LedgerEntry]; let onEntry: (LedgerEntry) -> Void
     var body: some View {
-        if entries.isEmpty { ContentUnavailableView("还没有记录", systemImage: "clock", description: Text("从总览的「买入 USDT」或「买入 BTC」按钮开始记录。")) }
+        if entries.isEmpty { ContentUnavailableView("还没有记录", systemImage: "clock", description: Text("从总览的「买入比特币」，或 USDT 页的「买入 USDT」开始记录。")) }
         else {
             List { ForEach(entries) { entry in Button { onEntry(entry) } label: { EntryRow(entry: entry) }.buttonStyle(.plain) } }.listStyle(.inset)
         }

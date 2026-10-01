@@ -111,11 +111,11 @@ func v1LoadDoesNotWriteAndFirstSavePreservesOriginalBytesExactlyOnce() throws {
     try originalBytes.write(to: url)
     let repo = try LedgerRepository(url: url)
     let migrated = try repo.load()
-    #expect(migrated.schemaVersion == 2)
+    #expect(migrated.schemaVersion == BackupDocument.currentSchemaVersion)
     #expect(try Data(contentsOf: url) == originalBytes)
     #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 1)
     try repo.save(migrated)
-    #expect(try BackupCodec.schemaVersion(in: Data(contentsOf: url)) == 2)
+    #expect(try BackupCodec.schemaVersion(in: Data(contentsOf: url)) == BackupDocument.currentSchemaVersion)
     let preserved = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         .filter { $0.lastPathComponent.hasPrefix("ledger.before-upgrade-v1-") }
     #expect(preserved.count == 1)
@@ -179,4 +179,49 @@ func unsupportedPolicyIsNeverSilentlyMigrated() throws {
     #expect(throws: (any Error).self) { try repo.save(BackupDocument()) }
     #expect(try Data(contentsOf: url) == original)
     #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 1)
+}
+
+@Test @MainActor
+func firstV2SavePreservesOriginalBytesBeforeUpgradingToV3() throws {
+    let url = temporaryLedgerURL()
+    let directory = url.deletingLastPathComponent()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let original = legacyV2Bytes()
+    try original.write(to: url)
+    let repository = try LedgerRepository(url: url)
+    let migrated = try repository.load()
+    #expect(migrated.schemaVersion == 3)
+    #expect(try Data(contentsOf: url) == original)
+    try repository.save(migrated)
+    #expect(try BackupCodec.schemaVersion(in: Data(contentsOf: url)) == 3)
+    let preserved = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        .filter { $0.lastPathComponent.hasPrefix("ledger.before-upgrade-v2-") }
+    #expect(preserved.count == 1)
+    let backup = try #require(preserved.first)
+    #expect(try Data(contentsOf: backup) == original)
+    try repository.save(migrated)
+    #expect(try Data(contentsOf: backup) == original)
+    let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+    #expect(names.filter { $0.hasPrefix("ledger.before-upgrade-v2-") }.count == 1)
+}
+
+@Test @MainActor
+func staleV2MigrationDoesNotOverwriteNewFileOrMakeExtraUpgradeBackups() throws {
+    let url = temporaryLedgerURL()
+    let directory = url.deletingLastPathComponent()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try legacyV2Bytes().write(to: url)
+    let first = try LedgerRepository(url: url)
+    let second = try LedgerRepository(url: url)
+    let oldDocument = try first.load()
+    var newDocument = try second.load()
+    newDocument.entries[0].note = "latest"
+    try second.save(newDocument)
+    let latestBytes = try Data(contentsOf: url)
+    #expect(throws: RepositoryError.self) { try first.save(oldDocument) }
+    #expect(try Data(contentsOf: url) == latestBytes)
+    let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+    #expect(names.filter { $0.hasPrefix("ledger.before-upgrade-v2-") }.count == 1)
 }

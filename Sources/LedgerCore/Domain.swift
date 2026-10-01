@@ -31,7 +31,7 @@ public struct Account: Identifiable, Codable, Equatable, Sendable {
 }
 
 public enum EntryKind: String, Codable, CaseIterable, Sendable {
-    case buy, transfer, sell, fee, buyUSDT, sellUSDT
+    case buy, transfer, sell, fee, buyUSDT, sellUSDT, adjustUSDT
 }
 
 public enum SettlementCurrency: String, Codable, CaseIterable, Sendable {
@@ -260,20 +260,31 @@ public struct EntryValuation: Codable, Equatable, Sendable {
     public var costCNY: Decimal
     public var feeCNYEquivalent: Decimal
     public var feeUnitCostCNY: Decimal
+    public var beforeUSDT: Decimal?
+    public var afterUSDT: Decimal?
 
-    public init(costCNY: Decimal = 0, feeCNYEquivalent: Decimal = 0, feeUnitCostCNY: Decimal = 0) {
+    public init(costCNY: Decimal = 0, feeCNYEquivalent: Decimal = 0, feeUnitCostCNY: Decimal = 0,
+                beforeUSDT: Decimal? = nil, afterUSDT: Decimal? = nil) {
         self.costCNY = costCNY
         self.feeCNYEquivalent = feeCNYEquivalent
         self.feeUnitCostCNY = feeUnitCostCNY
+        self.beforeUSDT = beforeUSDT
+        self.afterUSDT = afterUSDT
     }
 
-    private enum CodingKeys: String, CodingKey { case costCNY, feeCNYEquivalent, feeUnitCostCNY }
+    private enum CodingKeys: String, CodingKey { case costCNY, feeCNYEquivalent, feeUnitCostCNY, beforeUSDT, afterUSDT }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         costCNY = try Amounts.decimal(values.decode(String.self, forKey: .costCNY), maxPlaces: 12)
         feeCNYEquivalent = try Amounts.decimal(values.decode(String.self, forKey: .feeCNYEquivalent), maxPlaces: 12)
         feeUnitCostCNY = try Amounts.decimal(values.decode(String.self, forKey: .feeUnitCostCNY), maxPlaces: 12)
+        if let raw = try values.decodeIfPresent(String.self, forKey: .beforeUSDT) {
+            beforeUSDT = try Amounts.decimal(raw, maxPlaces: 8)
+        } else { beforeUSDT = nil }
+        if let raw = try values.decodeIfPresent(String.self, forKey: .afterUSDT) {
+            afterUSDT = try Amounts.decimal(raw, maxPlaces: 8)
+        } else { afterUSDT = nil }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -281,6 +292,8 @@ public struct EntryValuation: Codable, Equatable, Sendable {
         try values.encode(Amounts.string(costCNY), forKey: .costCNY)
         try values.encode(Amounts.string(feeCNYEquivalent), forKey: .feeCNYEquivalent)
         try values.encode(Amounts.string(feeUnitCostCNY), forKey: .feeUnitCostCNY)
+        if let beforeUSDT { try values.encode(Amounts.string(beforeUSDT), forKey: .beforeUSDT) }
+        if let afterUSDT { try values.encode(Amounts.string(afterUSDT), forKey: .afterUSDT) }
     }
 }
 

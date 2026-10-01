@@ -37,7 +37,7 @@ private func v2USDTFixture() -> BackupDocument {
 
 @Test func literalV1BackupUpgradesWithoutInventingUSDTOrRevaluingLegacyFees() throws {
     let upgraded = try BackupCodec.decode(legacyV1Bytes())
-    #expect(upgraded.schemaVersion == 2)
+    #expect(upgraded.schemaVersion == BackupDocument.currentSchemaVersion)
     #expect(upgraded.baseCurrency == "CNY")
     #expect(upgraded.accountingPolicy == BackupDocument.supportedAccountingPolicy)
     #expect(upgraded.accounts[0].isArchived == false)
@@ -50,12 +50,12 @@ private func v2USDTFixture() -> BackupDocument {
     #expect(state.totalSats == 100_000_000)
     #expect(state.usdtBalance == 0)
     #expect(state.totalFeeCNY == Decimal(string: "0.7")!)
-    #expect(try BackupCodec.schemaVersion(in: BackupCodec.encode(upgraded)) == 2)
+    #expect(try BackupCodec.schemaVersion(in: BackupCodec.encode(upgraded)) == BackupDocument.currentSchemaVersion)
 }
 
 @Test func unknownSchemaAndPolicyAreRejectedBeforeUnknownBodyDecoding() {
-    #expect(throws: BackupError.unsupportedSchema(3)) {
-        try BackupCodec.decode(Data(#"{"schemaVersion":3,"accounts":"future format","baseCurrency":{"future":"object"}}"#.utf8))
+    #expect(throws: BackupError.unsupportedSchema(4)) {
+        try BackupCodec.decode(Data(#"{"schemaVersion":4,"accounts":"future format","baseCurrency":{"future":"object"}}"#.utf8))
     }
     #expect(throws: BackupError.unsupportedAccountingPolicy("market-value-reset")) {
         try BackupCodec.decode(Data(#"{"schemaVersion":2,"baseCurrency":"CNY","accountingPolicy":"market-value-reset","entries":"future format"}"#.utf8))

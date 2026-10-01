@@ -74,6 +74,36 @@ final class AppStore: ObservableObject {
         else { candidate.entries.append(entry) }
         try commit(candidate)
     }
+    /// A reconciliation stores the observed balance as an anchor. Its actual
+    /// before/after projection comes from the same replay used by save/import.
+    func prepareUSDTAdjustment(to target: Decimal, note: String, existing: LedgerEntry? = nil,
+                               id: UUID = UUID(), date: Date = Date()) throws -> (entry: LedgerEntry, valuation: EntryValuation) {
+        guard canEdit else { throw UIError.text("请先恢复无法读取的账本。") }
+        if let existing {
+            guard existing.kind == .adjustUSDT, document.entries.contains(where: { $0.id == existing.id }) else {
+                throw UIError.text("这条余额调整已不存在，请关闭后重新打开。")
+            }
+        }
+        let next = (document.entries.map(\.sequence).max() ?? 0).addingReportingOverflow(1)
+        guard existing != nil || (!next.overflow && next.partialValue < Int64.max) else {
+            throw UIError.text("记录顺序超过支持范围。")
+        }
+        var entry = LedgerEntry(id: existing?.id ?? id, date: existing?.date ?? date,
+                                sequence: existing?.sequence ?? next.partialValue,
+                                kind: .adjustUSDT, feeCategory: .other,
+                                note: note.trimmingCharacters(in: .whitespacesAndNewlines),
+                                amountUSDT: existing?.amountUSDT ?? 0, receivedUSDT: target)
+        var entries = document.entries.filter { $0.id != entry.id }
+        entries.append(entry)
+        let replay = try LedgerEngine.calculate(accounts: document.accounts, entries: entries)
+        guard let valuation = replay.entryValuations[entry.id], let before = valuation.beforeUSDT else {
+            throw UIError.text("无法计算余额调整，请重新打开账本后再试。")
+        }
+        // Keep the initially observed book balance for audit; it is never used
+        // as a cached balance during subsequent historical replay.
+        entry.amountUSDT = existing?.amountUSDT ?? before
+        return (entry, valuation)
+    }
     func deleteEntry(_ entry: LedgerEntry) throws {
         var candidate = document
         candidate.entries.removeAll { $0.id == entry.id }
@@ -189,8 +219,8 @@ extension AccountKind {
     var icon: String { self == .selfCustody ? "wallet.bifold" : "building.columns" }
 }
 extension EntryKind {
-    var title: String { switch self { case .buy: "买入 BTC"; case .transfer: "转账"; case .sell: "卖出 / 花费 BTC"; case .fee: "其他手续费"; case .buyUSDT: "人民币买 USDT"; case .sellUSDT: "USDT 换回人民币" } }
-    var icon: String { switch self { case .buy: "arrow.down.left"; case .transfer: "arrow.left.arrow.right"; case .sell: "arrow.up.right"; case .fee: "minus.circle"; case .buyUSDT: "plus.circle"; case .sellUSDT: "yensign.circle" } }
+    var title: String { switch self { case .buy: "买入 BTC"; case .transfer: "转账"; case .sell: "卖出 / 花费 BTC"; case .fee: "其他手续费"; case .buyUSDT: "人民币买 USDT"; case .sellUSDT: "USDT 换回人民币"; case .adjustUSDT: "USDT 余额调整" } }
+    var icon: String { switch self { case .buy: "arrow.down.left"; case .transfer: "arrow.left.arrow.right"; case .sell: "arrow.up.right"; case .fee: "minus.circle"; case .buyUSDT: "plus.circle"; case .sellUSDT: "yensign.circle"; case .adjustUSDT: "slider.horizontal.3" } }
 }
 extension FeeCategory {
     var title: String { switch self { case .trading: "交易手续费"; case .withdrawal: "提币手续费"; case .network: "链上转账手续费"; case .other: "其他手续费" } }

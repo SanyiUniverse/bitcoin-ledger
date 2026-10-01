@@ -54,7 +54,7 @@ public final class LedgerRepository {
         } catch {
             throw RepositoryError.unreadableStore(error.localizedDescription)
         }
-        // v1 is upgraded in memory only. The original bytes stay untouched until
+        // Older versions upgrade in memory only. Original bytes stay untouched until
         // an ordinary save safely preserves them inside the coordinated write.
         return memoryDocument
     }
@@ -86,8 +86,9 @@ public final class LedgerRepository {
                     try writePrivate(data, to: coordinatedURL)
                     return
                 }
-                if try BackupCodec.schemaVersion(in: current) == 1 {
-                    let preserved = directory.appendingPathComponent("ledger.before-upgrade-v1-\(UUID().uuidString).json")
+                let originalVersion = try BackupCodec.schemaVersion(in: current)
+                if originalVersion < BackupDocument.currentSchemaVersion {
+                    let preserved = directory.appendingPathComponent("ledger.before-upgrade-v\(originalVersion)-\(UUID().uuidString).json")
                     try writePrivate(current, to: preserved)
                 }
                 if preserveCurrent {

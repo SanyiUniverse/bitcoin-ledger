@@ -32,6 +32,18 @@ public enum LedgerEngine {
         for entry in ordered {
             let valuation: EntryValuation
             switch entry.kind {
+            case .adjustUSDT:
+                // amountUSDT is the reference balance seen when entering this
+                // record. The target, not that old reference, anchors replay.
+                let priorBalance = result.usdtBalance
+                let priorCost = result.usdtCostBasisCNY
+                result.usdtBalance = entry.receivedUSDT
+                if result.usdtBalance == 0 {
+                    result.realizedPnLCNY = try adding(result.realizedPnLCNY, -priorCost)
+                    result.usdtCostBasisCNY = 0
+                }
+                valuation = EntryValuation(costCNY: priorCost, beforeUSDT: priorBalance,
+                                           afterUSDT: result.usdtBalance)
             case .buyUSDT:
                 // The C2C amount is total cash paid, including its CNY fee.
                 result.investedCNY = try adding(result.investedCNY, entry.amountCNY)
@@ -194,6 +206,14 @@ public enum LedgerEngine {
             }
         }
         switch entry.kind {
+        case .adjustUSDT:
+            guard entry.fromAccountID == nil, entry.toAccountID == nil,
+                  entry.amountSats == 0, entry.receivedSats == 0, entry.amountCNY == 0,
+                  entry.feeCurrency == .cny, entry.feeCNY == 0, entry.feeSats == 0,
+                  entry.feeUSDT == 0, entry.feePriceCNY == 0,
+                  entry.settlementCurrency == .cny, entry.feeValuationSource == .manualPrice else {
+                throw LedgerError.invalid("USDT 余额调整只填写参考余额、实际余额和备注，不填写交易金额、账户或手续费。")
+            }
         case .buyUSDT:
             guard entry.settlementCurrency == .cny, entry.fromAccountID == nil, entry.toAccountID == nil,
                   entry.amountSats == 0, entry.receivedSats == 0, entry.amountUSDT == 0,

@@ -100,3 +100,83 @@ func importPreservesSnapshotBeyondNextOrdinarySave() throws {
     #expect(preserved.count == 1)
     #expect(try BackupCodec.decode(Data(contentsOf: #require(preserved.first))) == original)
 }
+
+@Test @MainActor
+func v1LoadDoesNotWriteAndFirstSavePreservesOriginalBytesExactlyOnce() throws {
+    let url = temporaryLedgerURL()
+    let directory = url.deletingLastPathComponent()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let originalBytes = legacyV1Bytes()
+    try originalBytes.write(to: url)
+    let repo = try LedgerRepository(url: url)
+    let migrated = try repo.load()
+    #expect(migrated.schemaVersion == 2)
+    #expect(try Data(contentsOf: url) == originalBytes)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 1)
+    try repo.save(migrated)
+    #expect(try BackupCodec.schemaVersion(in: Data(contentsOf: url)) == 2)
+    let preserved = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        .filter { $0.lastPathComponent.hasPrefix("ledger.before-upgrade-v1-") }
+    #expect(preserved.count == 1)
+    let preservedURL = try #require(preserved.first)
+    #expect(try Data(contentsOf: preservedURL) == originalBytes)
+    let attributes = try FileManager.default.attributesOfItem(atPath: preservedURL.path)
+    #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+    try repo.save(migrated)
+    let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+    #expect(names.filter { $0.hasPrefix("ledger.before-upgrade-v1-") }.count == 1)
+    #expect(try Data(contentsOf: preservedURL) == originalBytes)
+}
+
+@Test @MainActor
+func migrationChecksConflictBeforeCreatingBackupOrOverwritingCurrentFile() throws {
+    let url = temporaryLedgerURL()
+    let directory = url.deletingLastPathComponent()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try legacyV1Bytes().write(to: url)
+    let first = try LedgerRepository(url: url)
+    let second = try LedgerRepository(url: url)
+    let staleDocument = try first.load()
+    var latest = try second.load()
+    latest.entries[0].note = "另一个写入者的有效修改"
+    try second.save(latest)
+    let currentBytes = try Data(contentsOf: url)
+    #expect(throws: RepositoryError.self) { try first.save(staleDocument) }
+    #expect(try Data(contentsOf: url) == currentBytes)
+    let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+    #expect(names.filter { $0.hasPrefix("ledger.before-upgrade-v1-") }.count == 1)
+}
+
+@Test @MainActor
+func recoveryCannotOverwriteChangedFileAfterFailedLoad() throws {
+    let url = temporaryLedgerURL()
+    let directory = url.deletingLastPathComponent()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try Data("{corrupt".utf8).write(to: url)
+    let repo = try LedgerRepository(url: url)
+    #expect(throws: (any Error).self) { try repo.load() }
+    let externalBytes = try BackupCodec.encode(BackupDocument())
+    try externalBytes.write(to: url, options: .atomic)
+    #expect(throws: RepositoryError.self) {
+        try repo.save(BackupDocument(), replacingCorruptStore: true)
+    }
+    #expect(try Data(contentsOf: url) == externalBytes)
+}
+
+@Test @MainActor
+func unsupportedPolicyIsNeverSilentlyMigrated() throws {
+    let url = temporaryLedgerURL()
+    let directory = url.deletingLastPathComponent()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let original = Data(#"{"schemaVersion":2,"baseCurrency":"CNY","accountingPolicy":"unknown-method"}"#.utf8)
+    try original.write(to: url)
+    let repo = try LedgerRepository(url: url)
+    #expect(throws: (any Error).self) { try repo.load() }
+    #expect(throws: (any Error).self) { try repo.save(BackupDocument()) }
+    #expect(try Data(contentsOf: url) == original)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 1)
+}

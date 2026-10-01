@@ -41,18 +41,21 @@ public final class LedgerRepository {
 
     public func load() throws -> BackupDocument {
         guard let url else { return memoryDocument }
-        let documentAndData: (BackupDocument, Data?) = try coordinated(url: url, writing: false) { coordinatedURL in
-            guard FileManager.default.fileExists(atPath: coordinatedURL.path) else { return (BackupDocument(), nil) }
-            do {
-                let data = try Data(contentsOf: coordinatedURL)
-                return (try BackupCodec.decode(data), data)
-            } catch {
-                throw RepositoryError.unreadableStore(error.localizedDescription)
-            }
+        let raw: Data? = try coordinated(url: url, writing: false) { coordinatedURL in
+            guard FileManager.default.fileExists(atPath: coordinatedURL.path) else { return nil }
+            return try Data(contentsOf: coordinatedURL)
         }
-        memoryDocument = documentAndData.0
-        lastReadData = documentAndData.1
+        // Even an invalid file establishes a conflict baseline. A recovery must
+        // not overwrite a different file that appeared after this failed load.
+        lastReadData = raw
         hasLoaded = true
+        do {
+            memoryDocument = try raw.map { try BackupCodec.decode($0) } ?? BackupDocument()
+        } catch {
+            throw RepositoryError.unreadableStore(error.localizedDescription)
+        }
+        // v1 is upgraded in memory only. The original bytes stay untouched until
+        // an ordinary save safely preserves them inside the coordinated write.
         return memoryDocument
     }
 
@@ -71,6 +74,7 @@ public final class LedgerRepository {
         try coordinated(url: url, writing: true) { coordinatedURL in
             let current = manager.fileExists(atPath: coordinatedURL.path) ? try Data(contentsOf: coordinatedURL) : nil
             if hasLoaded, current != lastReadData { throw RepositoryError.changedOnDisk }
+            if !hasLoaded, current != nil { throw RepositoryError.changedOnDisk }
 
             if let current {
                 do {
@@ -81,6 +85,10 @@ public final class LedgerRepository {
                     try writePrivate(current, to: preserved)
                     try writePrivate(data, to: coordinatedURL)
                     return
+                }
+                if try BackupCodec.schemaVersion(in: current) == 1 {
+                    let preserved = directory.appendingPathComponent("ledger.before-upgrade-v1-\(UUID().uuidString).json")
+                    try writePrivate(current, to: preserved)
                 }
                 if preserveCurrent {
                     let preserved = directory.appendingPathComponent("ledger.before-import-\(UUID().uuidString).json")

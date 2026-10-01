@@ -4,13 +4,21 @@ Bitcoin Ledger 是本机单用户账本。没有服务器、账号、CloudKit、
 
 ## 本地持久化
 
-V1 使用 `Codable` + `JSONEncoder`/`JSONDecoder`，账本位于 `~/Library/Application Support/Bitcoin Ledger/ledger.json`。BTC 使用 `Int64` satoshi，人民币与价格使用规范十进制字符串；计算才转换为 Foundation `Decimal`。JSON 结构含 `schemaVersion`，读入时拒绝不支持的版本和无效账目。
+本项目使用 `Codable` + `JSONEncoder`/`JSONDecoder`，账本位于 `~/Library/Application Support/Bitcoin Ledger/ledger.json`。BTC 使用 `Int64` satoshi，人民币与价格使用规范十进制字符串；计算才转换为 Foundation `Decimal`。JSON 结构含 `schemaVersion`，读入时拒绝不支持的版本和无效账目。
 
 原计划优先使用 SwiftData。已实际验证这台 Mac 的 Command Line Tools 能编译 SwiftUI，但没有 SwiftData 的 `SwiftDataMacros` 编译插件，`@Model` 无法构建。为一个小型个人账本安装完整 Xcode、引入替代数据库或手工仿制宏生成代码都增加维护成本。因此采用 Apple Foundation 的原子 JSON 快照；它同时保持数据可读、完整、可移植。未来可把同一值类型快照迁移到 SwiftData，不改变业务计算或备份格式。
 
 `LedgerRepository` 在主线程串行保存；先完整校验待保存文档，再通过 `NSFileCoordinator` 协调文件访问，以 `Data.write(options: .atomic)` 原子替换。保存成功后才更新内存。应用数据目录权限为 `0700`，账本及备份为 `0600`。替换前保留上一次有效快照 `ledger.previous.json`；它不是独立设备上的备份，仍应定期 Export Backup。
 
 读取失败会报告错误并保留原文件，不静默建立空账本覆盖原数据。显式从备份恢复时，可在保留损坏字节为 `ledger.corrupt-UUID.json` 后恢复。导入前的有效账本另外保存为 `ledger.before-import-UUID.json`，不会被后续日常保存覆盖。已读取文件若在其他进程被改动，保存会拒绝覆盖，要求重新打开应用。持久化测试覆盖重新打开、权限、无效保存、上一版本备份、损坏检测、恢复和并发覆盖。
+
+## V2 的最小扩展
+
+继续复用原生 Decimal、Codable、NSFileCoordinator、SwiftUI 表单和导航。未引入库、新数据库、USDT 行情 API 或汇率服务；人民币成本来自真实现金和交易原值，不从实时汇率猜测。Foundation Decimal 和 NSDecimalRound 官方接口于本次升级再次核对。
+
+`LedgerEntry` 增加 buyUSDT / sellUSDT 两种事件、BTC 买卖结算币种、USDT 数量与费用估价来源。旧字段原样兼容。`LedgerSnapshot` 增加单一 USDT 成本池、累计回款和逐笔 EntryValuation。业务逻辑仍只有一个完整重放引擎，不复制到 UI。
+
+备份版本 2 固定 `baseCurrency = CNY` 和 `accountingPolicy = cny-principal-moving-average-v1`，序列化派生快照前重算，恢复时核验。Repository 在首次覆盖旧版前先保存原始字节；已有账本遭外部修改时拒绝覆盖。详细口径见 Accounting.md。
 
 ## 构建与发布
 

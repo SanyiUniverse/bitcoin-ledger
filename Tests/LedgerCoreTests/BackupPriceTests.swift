@@ -44,9 +44,9 @@ private func backupFixture() -> BackupDocument {
 @Test func backupRejectsUnsupportedSchemaBeforeImport() throws {
     let data = try BackupCodec.encode(backupFixture())
     var object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
-    object["schemaVersion"] = 2
+    object["schemaVersion"] = 3
     let altered = try JSONSerialization.data(withJSONObject: object)
-    #expect(throws: BackupError.unsupportedSchema(2)) { try BackupCodec.decode(altered) }
+    #expect(throws: BackupError.unsupportedSchema(3)) { try BackupCodec.decode(altered) }
 }
 
 @Test func backupRejectsOversizeAndMalformedFiles() {

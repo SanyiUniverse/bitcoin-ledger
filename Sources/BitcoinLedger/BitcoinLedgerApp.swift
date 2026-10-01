@@ -9,7 +9,7 @@ struct BitcoinLedgerApp: App {
     var body: some Scene {
         Window("Bitcoin Ledger", id: "main") {
             ContentView().environmentObject(store)
-                .frame(minWidth: 900, minHeight: 680)
+                .frame(minWidth: 600, minHeight: 420)
                 .task {
                     await store.refreshPrice()
                     while !Task.isCancelled {
@@ -23,6 +23,7 @@ struct BitcoinLedgerApp: App {
                 }
         }
         .defaultSize(width: 1100, height: 800)
+        .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(after: .newItem) {
                 Button("导出完整备份…") { store.exportJSON() }.keyboardShortcut("e", modifiers: [.command, .shift]).disabled(!store.canEdit)

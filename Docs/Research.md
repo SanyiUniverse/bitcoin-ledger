@@ -35,6 +35,8 @@
 
 Apple 文档同时提供 `.md` 版本；Decimal 官方内容已读取，确认其 base-10 语义、字符串解析及舍入 API，未依赖对库功能的记忆。
 
+窗口缩放补充核验：Apple [`WindowResizability.contentMinSize`](https://developer.apple.com/documentation/swiftui/windowresizability/contentminsize) 以内容最小尺寸约束窗口，不施加最大尺寸；[`AnyLayout`](https://developer.apple.com/documentation/swiftui/anylayout) 可切换横排和纵排布局。两者均支持 macOS 13 及以上，覆盖本项目最低 macOS 14。采用这些原生能力，将主窗口最小尺寸从 900 × 680 调整为 600 × 420，默认仍为 1100 × 800；内容区低于 650 时纵排卡片，并让列表日期和账户余额换行，无需第三方布局库。
+
 ## 本地持久化选择
 
 首选项已经调查 [SwiftData](https://developer.apple.com/documentation/swiftdata)。当前 Mac 只有可用的 Command Line Tools 环境，实际编译探针发现 SwiftData 的宏支持不可用；为了让交付物在这台 Mac 立即可构建、可运行，V1 使用 Foundation Codable 与原子 JSON 文件保存，而不是安装重量级工具链或引入第三方数据库。

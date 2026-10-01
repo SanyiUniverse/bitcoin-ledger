@@ -2,6 +2,8 @@
 
 Bitcoin Ledger 是本机单用户账本。没有服务器、账号、CloudKit、钱包或交易权限，也没有第三方依赖。SwiftUI 负责原生窗口、导航、列表、表单和文件对话框；Foundation 负责精确十进制计算、JSON、文件协调及网络请求。LedgerCore 保存可测试的值类型和计算规则，UI 只展示结果并提交经过校验的完整快照。
 
+主窗口默认 1100 × 800，内容最小尺寸由 900 × 680 降至 600 × 420，使用 `.windowResizability(.contentMinSize)`，不设置应用级最大尺寸。内容区域宽度低于 650 时，`GeometryReader` 配合 Apple `AnyLayout` 在 `HStackLayout` / `VStackLayout` 间切换，卡片改为纵排；列表日期和账户余额允许换行。继续使用原生 SwiftUI，不增加布局依赖。
+
 ## 本地持久化
 
 本项目使用 `Codable` + `JSONEncoder`/`JSONDecoder`，账本位于 `~/Library/Application Support/Bitcoin Ledger/ledger.json`。BTC 使用 `Int64` satoshi，人民币与价格使用规范十进制字符串；计算才转换为 Foundation `Decimal`。JSON 结构含 `schemaVersion`，读入时拒绝不支持的版本和无效账目。

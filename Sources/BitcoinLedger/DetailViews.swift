@@ -24,9 +24,11 @@ struct AccountsView: View {
                                 HStack {
                                     Button { selected = selected == account.id ? nil : account.id } label: {
                                         HStack {
-                                            Text(account.name).font(.headline)
+                                            VStack(alignment: .leading, spacing: 4) {
+                                                Text(account.name).font(.headline)
+                                                Text("\(Display.btc(store.snapshot?.balances[account.id] ?? 0)) BTC").monospacedDigit()
+                                            }
                                             Spacer()
-                                            Text("\(Display.btc(store.snapshot?.balances[account.id] ?? 0)) BTC").monospacedDigit()
                                             Image(systemName: selected == account.id ? "chevron.down" : "chevron.right").font(.caption)
                                         }.contentShape(Rectangle())
                                     }.buttonStyle(.plain)

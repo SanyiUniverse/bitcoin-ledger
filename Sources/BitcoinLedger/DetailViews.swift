@@ -11,7 +11,7 @@ struct AccountsView: View {
             VStack(alignment: .leading, spacing: 24) {
                 HStack {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("所有账户").font(.title2.weight(.semibold))
+                        Text("BTC 账户").font(.title2.weight(.semibold))
                         Text("\(Display.btc(store.snapshot?.totalSats ?? 0)) BTC").font(.title3).monospacedDigit()
                     }
                     Spacer()
@@ -67,24 +67,52 @@ struct EntryDetail: View {
     let entry: LedgerEntry; let onEdit: () -> Void
     @State private var confirmDelete = false
     @State private var error: String?
+    private var valuation: EntryValuation? { store.valuation(for: entry) }
+    private var title: String {
+        entry.kind == .sell && entry.settlementCurrency == .cny && entry.amountCNY == 0 ? "花费 BTC" : entry.kind.title
+    }
+    private var hasFee: Bool { entry.feeSats > 0 || entry.feeCNY > 0 || entry.feeUSDT > 0 }
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            Label(entry.kind.title, systemImage: entry.kind.icon).font(.title2.weight(.semibold))
-            VStack(spacing: 14) {
-                DataRow("日期时间", entry.date.formatted(date: .complete, time: .standard))
-                if entry.kind != .buy { DataRow("转出账户", store.accountName(entry.fromAccountID)) }
-                if entry.kind == .buy || entry.kind == .transfer { DataRow("到账账户", store.accountName(entry.toAccountID)) }
-                if entry.kind != .fee { DataRow(entry.kind == .buy ? "实际获得" : "转出 / 卖出", "\(Display.btc(entry.amountSats)) BTC") }
-                if entry.kind == .transfer { DataRow("实际到账", "\(Display.btc(entry.receivedSats)) BTC") }
-                if entry.kind == .buy || entry.kind == .sell { DataRow(entry.kind == .buy ? "购币金额（不含人民币手续费）" : "实际收到人民币", Display.money(entry.amountCNY)) }
-                Divider()
-                DataRow(entry.feeCategory.title, Display.fee(entry))
-                if entry.feeSats > 0 {
-                    DataRow("发生时 BTC / CNY", Display.money(entry.feePriceCNY))
-                    DataRow("手续费人民币等值", "¥\(Display.decimal(entry.feeCNYEquivalent))")
+            Label(title, systemImage: entry.kind.icon).font(.title2.weight(.semibold))
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(spacing: 14) {
+                        DataRow("日期时间", entry.date.formatted(date: .complete, time: .standard))
+                        transactionRows
+                        if let valuation, entry.kind != .fee {
+                            Divider()
+                            DataRow(principalLabel, Display.money(valuation.costCNY))
+                            if entry.kind == .sell && entry.settlementCurrency == .usdt {
+                                DataRow("计入 USDT 的人民币本金", Display.money(valuation.costCNY + entry.feeCNY))
+                                Text("卖回 USDT 延续这笔 BTC 的原始本金；额外支付的人民币手续费一并计入，暂不确认已兑人民币盈亏。")
+                                    .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                            } else if entry.kind == .transfer {
+                                Text("本金继续由 BTC 持仓承接。转账不是买卖，余额只减少手续费。")
+                                    .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        if hasFee {
+                            Divider()
+                            DataRow(entry.feeCategory.title, Display.fee(entry))
+                            if let valuation {
+                                DataRow("手续费人民币等值", "¥\(Display.decimal(valuation.feeCNYEquivalent))")
+                            }
+                            if entry.feeSats > 0 && entry.feeValuationSource == .manualPrice {
+                                DataRow("记录时 BTC / CNY", Display.money(entry.feePriceCNY))
+                            } else if entry.feeSats > 0 || entry.feeUSDT > 0 {
+                                Text("费用按本笔交易或扣款前的人民币成本自动折算。")
+                                    .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                    if !entry.note.isEmpty {
+                        Text(entry.note).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                            .padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                    }
                 }
+                .padding(.trailing, 4)
             }
-            if !entry.note.isEmpty { Text(entry.note).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 8)) }
             if let error { Text(error).foregroundStyle(.red) }
             HStack {
                 Button("删除记录", role: .destructive) { confirmDelete = true }
@@ -92,11 +120,57 @@ struct EntryDetail: View {
                 Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("编辑", action: onEdit).buttonStyle(.borderedProminent)
             }
-        }.padding(28).frame(width: 610)
+        }.padding(28).frame(width: 650, height: 640)
         .confirmationDialog("删除这条记录？所有余额和成本将重新计算。", isPresented: $confirmDelete) {
             Button("删除", role: .destructive) {
                 do { try store.deleteEntry(entry); dismiss() } catch { self.error = error.localizedDescription }
             }
+        }
+    }
+
+    @ViewBuilder private var transactionRows: some View {
+        switch entry.kind {
+        case .buy:
+            DataRow("到账账户", store.accountName(entry.toAccountID))
+            DataRow("实际获得 BTC", "\(Display.btc(entry.amountSats)) BTC")
+            if entry.settlementCurrency == .usdt {
+                DataRow("实际扣除 USDT（含 USDT 手续费）", "\(Display.usdt(entry.amountUSDT)) USDT")
+                if entry.feeCNY > 0 { DataRow("额外支付人民币手续费", Display.money(entry.feeCNY)) }
+            } else {
+                DataRow("购币金额（不含人民币手续费）", Display.money(entry.amountCNY))
+            }
+        case .sell:
+            DataRow("转出账户", store.accountName(entry.fromAccountID))
+            DataRow("卖出 / 花费 BTC", "\(Display.btc(entry.amountSats)) BTC")
+            if entry.settlementCurrency == .usdt {
+                DataRow("实际到账 USDT（已扣手续费）", "\(Display.usdt(entry.receivedUSDT)) USDT")
+            } else {
+                DataRow("实际收到人民币", Display.money(entry.amountCNY))
+            }
+        case .transfer:
+            DataRow("转出账户", store.accountName(entry.fromAccountID))
+            DataRow("到账账户", store.accountName(entry.toAccountID))
+            DataRow("实际转出 BTC", "\(Display.btc(entry.amountSats)) BTC")
+            DataRow("实际到账 BTC", "\(Display.btc(entry.receivedSats)) BTC")
+        case .buyUSDT:
+            DataRow("购入 USDT 支付人民币", Display.money(entry.amountCNY))
+            DataRow("实际到账 USDT", "\(Display.usdt(entry.receivedUSDT)) USDT")
+        case .sellUSDT:
+            DataRow("实际扣除 USDT（含 USDT 手续费）", "\(Display.usdt(entry.amountUSDT)) USDT")
+            DataRow("实际收到人民币", Display.money(entry.amountCNY))
+        case .fee:
+            if let id = entry.fromAccountID { DataRow("支付账户", store.accountName(id)) }
+            else { DataRow("支付来源", entry.feeCurrency == .usdt ? "USDT 周转余额" : "人民币") }
+        }
+    }
+    private var principalLabel: String {
+        switch entry.kind {
+        case .buy: "计入 BTC 的人民币本金"
+        case .buyUSDT: "计入 USDT 的人民币本金"
+        case .sell: "移出 BTC 的人民币本金"
+        case .sellUSDT: "移出 USDT 的人民币本金"
+        case .transfer: "转出 BTC 对应的人民币本金"
+        case .fee: "费用对应的人民币本金"
         }
     }
 }
@@ -108,14 +182,16 @@ struct RulesView: View {
             Text("账目计算规则").font(.title2.weight(.semibold))
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    rule("按发生时间重算", "所有记录按日期时间和录入顺序重算。编辑或删除后也一样；如果会让任何账户在历史某个时点余额为负，则阻止保存。BTC 使用整数 satoshi，人民币使用十进制数。")
-                    rule("买入与累计投入", "买入 BTC 填实际到账净数量；人民币填不含额外人民币手续费的购币金额。累计投入 = 购币金额 + 额外支付的人民币手续费。累计购买 BTC = 实际到账 BTC + 从本次买入扣除的 BTC 手续费。")
-                    rule("平均买价与实际成本", "平均买入价格 = 累计购币金额 ÷ 累计购买 BTC，不含人民币手续费。实际成本价 = 剩余持仓总成本 ÷ 当前 BTC，包含已承担的费用损耗。无分母时显示 —。")
-                    rule("转账与费用", "转账手续费 = 转出总量 − 实际到账。总 BTC 只减少手续费；转账不增加买入或投入。BTC 费用按发生时价格折算，仅用于费用统计，不再次增加人民币成本。剩余 BTC 承担原成本；全部消耗时将剩余成本计入已实现损失。")
-                    rule("卖出与花费", "卖出数量不含额外 BTC 手续费；人民币是已经扣除人民币手续费的实际到账。卖出和额外 BTC 手续费一起按移动加权成本分摊；已实现盈亏 = 净到账人民币 − 分摊成本。花费 BTC 时人民币填 0。")
-                    rule("持仓盈亏与费用占比", "当前价值 = 当前 BTC × 最新参考价格。未实现盈亏 = 当前价值 − 剩余持仓成本；收益率 = 未实现盈亏 ÷ 剩余持仓成本。手续费占比 = 累计手续费人民币等值 ÷ 累计人民币投入。")
+                    rule("按真实现金本金记账", "这里追踪实际投入人民币、实际收回人民币，以及尚由 BTC 和 USDT 承接的本金。它是个人现金本金账本，不是税务核算，也不会按交易时的市场价重置本金。")
+                    rule("投入与回款", "人民币购入 USDT、直接购入 BTC，以及额外支付的人民币手续费，增加累计投入。实际兑换并收到人民币，增加累计回款。使用已有 USDT 买 BTC，不会再次增加人民币投入。")
+                    rule("USDT 的本金", "USDT 余额与人民币本金独立记录。每 USDT 平均本金 = 剩余人民币本金 ÷ USDT 余额，它不是 USDT 当前市值。使用 USDT 时，按使用前的平均本金分摊。")
+                    rule("BTC 与 USDT 互换", "USDT 买入 BTC，把支出 USDT 对应的原始人民币本金转入 BTC；BTC 卖回 USDT，把卖出 BTC 对应的原始本金转入 USDT。额外人民币手续费一并计入承接的本金。这些互换不确认已兑人民币盈亏。")
+                    rule("人民币回款与损失", "卖出 BTC 或 USDT 收到人民币时，按卖出前的平均本金分摊本次移出本金。已兑人民币盈亏 = 实际回款 − 对应本金，并包含直接消费 BTC、费用耗尽 BTC 或 USDT 的剩余本金损失，以及无 BTC 持仓时独立支付的人民币费用。BTC 换回 USDT 本身不确认盈亏。人民币填写扣除手续费后的实际到账，避免重复扣费。")
+                    rule("转账与手续费", "BTC 转账手续费 = 实际转出总量 − 实际到账；到账部分只是移动账户，转账不增加投入。BTC 和 USDT 费用按本笔交易或扣款前的人民币成本自动折算，也可选择手动记录历史价格。自动折算会随之前的账目修改重新计算，不随实时行情变化；手动记录的价格会保留。")
+                    rule("BTC 持仓的浮动盈亏", "当前 BTC 市值 = BTC 数量 × 最新参考价格。持仓浮动盈亏 = BTC 市值 − BTC 持仓本金；浮动收益率 = 浮动盈亏 ÷ BTC 持仓本金。它与已经兑现的人民币盈亏分开展示。手续费占比 = 累计手续费人民币等值 ÷ 累计人民币投入；没有分母时显示 —。")
+                    rule("每次修改都重新计算", "记录按日期时间、同时间录入顺序重算。编辑、删除或导入若会导致任一时点 BTC 账户或 USDT 余额不足，就不保存。BTC 精确到 1 satoshi，USDT 与人民币采用十进制数。原有人民币直接买卖 BTC 的记录仍可查看和编辑。")
                     rule("本地数据与备份", "账本仅保存在此 Mac 的 Application Support/Bitcoin Ledger 中。每次保存保留上一版；JSON 是可完整恢复的备份，CSV 供查看交易明细。导出的备份是明文，请存放在你信任的位置。")
-                    rule("参考价格", "行情来自 Blockchain.com；显示成功获取时间，该 API 不提供成交时间。网络失败继续使用缓存。BTC 历史手续费价格会随记录保存，后续刷新行情不会改写。")
+                    rule("参考价格", "BTC 人民币参考行情来自 Blockchain.com；显示成功获取时间，该 API 不提供成交时间。网络失败继续显示缓存。参考行情只用于 BTC 市值和浮动盈亏，不改变任何原始本金。")
                 }.padding(.trailing, 8)
             }
             HStack { Spacer(); Button("好") { dismiss() }.keyboardShortcut(.defaultAction) }

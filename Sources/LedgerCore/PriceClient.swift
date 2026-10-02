@@ -3,34 +3,34 @@ import Foundation
 /// The provider does not publish a market timestamp. `fetchedAt` is the time
 /// this application successfully received the quote, not the last trade time.
 public struct PriceQuote: Codable, Equatable, Sendable {
-    public var priceCNY: Decimal
+    public var priceUSD: Decimal
     public var fetchedAt: Date
     public var source: String
 
-    public init(priceCNY: Decimal, fetchedAt: Date = Date(), source: String = "Blockchain.com") {
-        self.priceCNY = priceCNY
+    public init(priceUSD: Decimal, fetchedAt: Date = Date(), source: String = "Blockchain.com") {
+        self.priceUSD = priceUSD
         self.fetchedAt = fetchedAt
         self.source = source
     }
 
-    private enum CodingKeys: String, CodingKey { case priceCNY, fetchedAt, source }
+    private enum CodingKeys: String, CodingKey { case priceUSD, fetchedAt, source }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let text = try container.decode(String.self, forKey: .priceCNY)
+        let text = try container.decode(String.self, forKey: .priceUSD)
         guard text.range(of: "^[0-9]+(?:\\.[0-9]+)?$", options: .regularExpression) != nil,
               let price = try? Amounts.decimal(text, maxPlaces: 38),
               price > 0, price <= Decimal(1_000_000_000_000) else {
-            throw DecodingError.dataCorruptedError(forKey: .priceCNY, in: container, debugDescription: "Invalid BTC/CNY price")
+            throw DecodingError.dataCorruptedError(forKey: .priceUSD, in: container, debugDescription: "Invalid BTC/USD price")
         }
-        priceCNY = price
+        priceUSD = price
         fetchedAt = try container.decode(Date.self, forKey: .fetchedAt)
         source = try container.decode(String.self, forKey: .source)
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(NSDecimalNumber(decimal: priceCNY).stringValue, forKey: .priceCNY)
+        try container.encode(NSDecimalNumber(decimal: priceUSD).stringValue, forKey: .priceUSD)
         try container.encode(fetchedAt, forKey: .fetchedAt)
         try container.encode(source, forKey: .source)
     }
@@ -72,9 +72,11 @@ public struct PriceClient: Sendable {
     }
 
     public func fetch() async throws -> PriceQuote {
+        try Task.checkCancellation()
         var request = URLRequest(url: Self.endpoint)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
+        try Task.checkCancellation()
         guard let response = response as? HTTPURLResponse else { throw PriceError.invalidResponse }
         guard (200...299).contains(response.statusCode) else { throw PriceError.httpStatus(response.statusCode) }
         return try Self.decode(data: data, fetchedAt: Date())
@@ -88,14 +90,14 @@ public struct PriceClient: Sendable {
         // Decode JSON numbers directly to Foundation Decimal, never through Double.
         struct Ticker: Decodable {
             struct Currency: Decodable { let last: Decimal }
-            let CNY: Currency
+            let USD: Currency
         }
         guard data.count <= 1_000_000 else { throw PriceError.invalidResponse }
         let ticker: Ticker
         do { ticker = try JSONDecoder().decode(Ticker.self, from: data) }
         catch { throw PriceError.invalidResponse }
-        guard ticker.CNY.last > 0, ticker.CNY.last <= Decimal(1_000_000_000_000),
+        guard ticker.USD.last > 0, ticker.USD.last <= Decimal(1_000_000_000_000),
               fetchedAt.timeIntervalSinceReferenceDate.isFinite else { throw PriceError.invalidPrice }
-        return PriceQuote(priceCNY: ticker.CNY.last, fetchedAt: fetchedAt)
+        return PriceQuote(priceUSD: ticker.USD.last, fetchedAt: fetchedAt)
     }
 }

@@ -45,7 +45,7 @@ func legacyV2Bytes() -> Data { try! legacyBytes(version: 2, entries: [legacyReco
 
 @Test func migrationV1RetainsCashNetBTCDateIDAndAccountIDs() throws {
     let document = try BackupCodec.decode(legacyV1Bytes())
-    #expect(document.schemaVersion == 4)
+    #expect(document.schemaVersion == 5)
     #expect(document.accounts.map(\.id) == [oldExchange, oldWallet])
     #expect(document.accounts.map(\.name) == ["欧易", "自有钱包"])
     #expect(document.entries[0].date == Date(timeIntervalSince1970: (legacyTime + 1_000) / 1_000))
@@ -65,7 +65,8 @@ func legacyV2Bytes() -> Data { try! legacyBytes(version: 2, entries: [legacyReco
     #expect(snapshot.totalPurchasedSats == 99_800)
     #expect(snapshot.totalSats == 99_800)
     #expect(snapshot.totalLossSats == 0)
-    #expect(snapshot.totalInvestedCNY == 500)
+    #expect(document.entries.reduce(Decimal(0)) { $0 + $1.amountCNY } == 500)
+    #expect(snapshot.totalInvestedUSD == nil)
 }
 @Test func migrationCNYBuyIncludesActuallyPaidCNYFee() throws {
     var entry = legacyRecord(1, cny: "500.01", sats: 100_000)
@@ -82,7 +83,8 @@ func legacyV2Bytes() -> Data { try! legacyBytes(version: 2, entries: [legacyReco
     let document = try BackupCodec.decode(legacyBytes(entries: [firstFunding, firstBuy, secondFunding, secondBuy]))
     let snapshot = try LedgerEngine.calculate(accounts: document.accounts, entries: document.entries)
     #expect(document.entries.count == 2)
-    #expect(snapshot.totalInvestedCNY == Decimal(string: "490.35")!)
+    #expect(document.entries.reduce(Decimal(0)) { $0 + $1.amountCNY } == Decimal(string: "490.35")!)
+    #expect(snapshot.totalInvestedUSD == nil)
     #expect(snapshot.totalPurchasedSats == 97_000)
     #expect(snapshot.totalSats == 97_000)
     #expect(snapshot.totalLossSats == 0)

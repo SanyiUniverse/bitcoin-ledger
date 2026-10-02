@@ -5,10 +5,10 @@ import Testing
 private func backupFixture() -> BackupDocument {
     let account = Account.defaults[0]
     let date = Date(timeIntervalSince1970: 1_790_830_000.123456)
-    let entry = LedgerEntry(date: date, kind: .buy, toAccountID: account.id,
+    let entry = syntheticEntry(date: date, kind: .buy, toAccountID: account.id,
                             receivedSats: 15_324, amountCNY: Decimal(string: "100.01")!, note: "合成数据")
     return BackupDocument(exportedAt: date, accounts: Account.defaults, entries: [entry],
-        lastPrice: PriceQuote(priceCNY: Decimal(string: "564693.92")!, fetchedAt: date))
+        lastPrice: PriceQuote(priceUSD: Decimal(string: "564693.92")!, fetchedAt: date))
 }
 
 @Test func backupRoundTripRetainsExactMoneySatoshisAndTime() throws {
@@ -20,7 +20,7 @@ private func backupFixture() -> BackupDocument {
     let entries = try #require(object["entries"] as? [[String: Any]])
     #expect(entries[0]["amountCNY"] as? String == "100.01")
     #expect(entries[0]["receivedSats"] as? Int64 == 15_324)
-    #expect(Set(entries[0].keys) == Set(["id", "date", "sequence", "kind", "toAccountID", "amountSats", "receivedSats", "amountCNY", "note"]))
+    #expect(Set(entries[0].keys) == Set(["id", "date", "sequence", "kind", "toAccountID", "amountSats", "receivedSats", "amountCNY", "conversion", "note"]))
     #expect(abs(restored.entries[0].date.timeIntervalSince(fixture.entries[0].date)) < 0.000001)
 }
 @Test func backupSeedsTwoAccountsAndNoOtherAssets() throws {
@@ -30,8 +30,8 @@ private func backupFixture() -> BackupDocument {
     #expect(try BackupCodec.decode(BackupCodec.encode(document)) == document)
 }
 @Test func backupRejectsFutureVersionBeforeReadingFutureBody() {
-    #expect(throws: BackupError.unsupportedSchema(5)) {
-        try BackupCodec.decode(Data(#"{"schemaVersion":5,"baseCurrency":{"future":"body"}}"#.utf8))
+    #expect(throws: BackupError.unsupportedSchema(6)) {
+        try BackupCodec.decode(Data(#"{"schemaVersion":6,"baseCurrency":{"future":"body"}}"#.utf8))
     }
 }
 @Test func backupRejectsOversizeAndMalformedFiles() {
@@ -56,7 +56,7 @@ private func backupFixture() -> BackupDocument {
     document.accounts = []
     #expect(throws: (any Error).self) { try BackupCodec.encode(document) }
     document = backupFixture()
-    document.lastPrice?.priceCNY = 0
+    document.lastPrice?.priceUSD = 0
     #expect(throws: (any Error).self) { try BackupCodec.encode(document) }
 }
 @Test func backupRejectsUnknownAccountingPolicy() {
@@ -68,8 +68,8 @@ private func backupFixture() -> BackupDocument {
     let data = try BackupCodec.csv(backupFixture())
     #expect(data.starts(with: [0xEF, 0xBB, 0xBF]))
     let csv = try #require(String(data: data, encoding: .utf8))
-    #expect(csv.contains("15324,0.00015324,15324,0.00015324,100.01,0,0"))
-    #expect(csv.contains("loss_sats,loss_btc,note"))
+    #expect(csv.contains("15324,0.00015324,15324,0.00015324,100.01,100.01,1"))
+    #expect(csv.contains("amount_usd,cny_per_usd,fx_date_utc,fx_source,loss_sats,loss_btc,note"))
     #expect(!csv.lowercased().contains("usdt"))
     #expect(!csv.lowercased().contains("fee_"))
     #expect(csv.hasSuffix("\r\n"))

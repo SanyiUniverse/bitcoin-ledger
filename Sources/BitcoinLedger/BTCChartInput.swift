@@ -11,6 +11,20 @@ enum BTCChartInputMath {
         guard magnification.isFinite, magnification != 0 else { return nil }
         return 1 / max(0.05, 1 + magnification)
     }
+    static func priceDragFactor(points: Double, plotHeight: Double) -> Double {
+        guard points.isFinite, plotHeight.isFinite, plotHeight > 0 else { return 1 }
+        return exp(max(-4, min(4, points * 2 / plotHeight)))
+    }
+}
+
+enum BTCChartInputArea { case plot, priceAxis }
+
+struct BTCChartInputSnapshot: Equatable {
+    let timeWindow: ClosedRange<Date>
+    let priceDomain: ClosedRange<Double>
+    let visibleOHLCCount: Int
+    let visibleOHLCDomain: ClosedRange<Double>?
+    let manualPriceScale: Bool
 }
 
 /// A plot-local responder: vertical scrolling continues to the surrounding
@@ -22,6 +36,10 @@ struct BTCChartInput: NSViewRepresentable {
     var onMagnify: (Double, CGPoint) -> Void
     var onStep: (Int) -> Void
     var onDismissDetails: () -> Void
+    var area: BTCChartInputArea = .plot
+    var onPriceDrag: ((Double, CGPoint) -> Void)? = nil
+    var onPriceReset: (() -> Void)? = nil
+    var snapshot: BTCChartInputSnapshot? = nil
 
     func makeNSView(context: Context) -> BTCChartInputView { BTCChartInputView() }
     func updateNSView(_ view: BTCChartInputView, context: Context) {
@@ -29,6 +47,8 @@ struct BTCChartInput: NSViewRepresentable {
         view.onHover = onHover; view.onPan = onPan
         view.onMagnify = onMagnify; view.onStep = onStep
         view.onDismissDetails = onDismissDetails
+        view.area = area; view.onPriceDrag = onPriceDrag; view.onPriceReset = onPriceReset
+        view.snapshot = snapshot
     }
     static func dismantleNSView(_ view: BTCChartInputView, coordinator: ()) { view.removeEventMonitor() }
 }
@@ -36,7 +56,10 @@ struct BTCChartInput: NSViewRepresentable {
 final class BTCChartInputView: NSView {
     var inputEnabled = true {
         didSet {
-            if !inputEnabled, window?.firstResponder === self { window?.makeFirstResponder(nil) }
+            if !inputEnabled {
+                dragAnchor = nil; lastDragWindowPoint = nil; pinchAnchor = nil
+                if window?.firstResponder === self { window?.makeFirstResponder(nil) }
+            }
         }
     }
     var onHover: ((CGPoint?) -> Void)?
@@ -44,8 +67,15 @@ final class BTCChartInputView: NSView {
     var onMagnify: ((Double, CGPoint) -> Void)?
     var onStep: ((Int) -> Void)?
     var onDismissDetails: (() -> Void)?
+    var area: BTCChartInputArea = .plot
+    var onPriceDrag: ((Double, CGPoint) -> Void)?
+    var onPriceReset: (() -> Void)?
+    var snapshot: BTCChartInputSnapshot?
     private var eventMonitor: Any?
     private var mouseTracking: NSTrackingArea?
+    private var dragAnchor: CGPoint?
+    private var lastDragWindowPoint: CGPoint?
+    private var pinchAnchor: CGPoint?
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { inputEnabled }
 
@@ -68,18 +98,18 @@ final class BTCChartInputView: NSView {
         let inside = bounds.contains(convert(event.locationInWindow, from: nil))
         switch event.type {
         case .leftMouseDown:
-            if !inside {
+            if !inside, area == .plot {
                 onDismissDetails?()
                 if window.firstResponder === self { window.makeFirstResponder(nil) }
             }
         case .scrollWheel:
-            if inside, BTCChartInputMath.horizontalDelta(x: event.scrollingDeltaX, y: event.scrollingDeltaY,
+            if inside, area == .plot, BTCChartInputMath.horizontalDelta(x: event.scrollingDeltaX, y: event.scrollingDeltaY,
                                                         precise: event.hasPreciseScrollingDeltas) != nil {
                 scrollWheel(with: event)
                 return nil
             }
         case .magnify:
-            if inside, BTCChartInputMath.zoomFactor(magnification: event.magnification) != nil {
+            if inside {
                 magnify(with: event)
                 return nil
             }
@@ -103,25 +133,47 @@ final class BTCChartInputView: NSView {
     private func point(_ event: NSEvent) -> CGPoint { convert(event.locationInWindow, from: nil) }
     override func mouseEntered(with event: NSEvent) { if inputEnabled { onHover?(point(event)) } }
     override func mouseMoved(with event: NSEvent) { if inputEnabled { onHover?(point(event)) } }
-    override func mouseDragged(with event: NSEvent) { if inputEnabled { onHover?(point(event)) } }
+    override func mouseDragged(with event: NSEvent) {
+        guard inputEnabled else { return }
+        let current = point(event)
+        if area == .priceAxis, let dragAnchor, let lastDragWindowPoint {
+            onPriceDrag?(lastDragWindowPoint.y - event.locationInWindow.y, dragAnchor)
+            self.lastDragWindowPoint = event.locationInWindow
+        } else { onHover?(current) }
+    }
+    override func mouseUp(with event: NSEvent) { dragAnchor = nil; lastDragWindowPoint = nil }
     override func mouseExited(with event: NSEvent) { onHover?(nil) }
     override func mouseDown(with event: NSEvent) {
         guard inputEnabled else { super.mouseDown(with: event); return }
+        if area == .priceAxis {
+            if event.clickCount == 2 { onPriceReset?(); dragAnchor = nil; lastDragWindowPoint = nil }
+            else { dragAnchor = point(event); lastDragWindowPoint = event.locationInWindow }
+            return
+        }
         window?.makeFirstResponder(self)
         onHover?(point(event))
     }
     override func scrollWheel(with event: NSEvent) {
-        guard inputEnabled, let delta = BTCChartInputMath.horizontalDelta(
+        guard inputEnabled, area == .plot, let delta = BTCChartInputMath.horizontalDelta(
             x: event.scrollingDeltaX, y: event.scrollingDeltaY, precise: event.hasPreciseScrollingDeltas) else {
             super.scrollWheel(with: event); return
         }
         onPan?(delta)
     }
     override func magnify(with event: NSEvent) {
-        guard inputEnabled, let factor = BTCChartInputMath.zoomFactor(magnification: event.magnification) else {
+        guard inputEnabled else {
             super.magnify(with: event); return
         }
-        onMagnify?(factor, point(event))
+        let current = point(event)
+        if area == .priceAxis {
+            if event.phase == .began || pinchAnchor == nil { pinchAnchor = current }
+            if let factor = BTCChartInputMath.zoomFactor(magnification: event.magnification) {
+                onMagnify?(factor, pinchAnchor ?? current)
+            }
+            if event.phase == .ended || event.phase == .cancelled || event.phase.isEmpty { pinchAnchor = nil }
+        } else if let factor = BTCChartInputMath.zoomFactor(magnification: event.magnification) {
+            onMagnify?(factor, current)
+        }
     }
     override func keyDown(with event: NSEvent) {
         let modifiers = event.modifierFlags.intersection([.command, .control, .option])

@@ -13,9 +13,10 @@ struct EntryDetail: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     VStack(spacing: 14) {
-                        DataRow("日期", entry.date.formatted(date: .complete, time: .omitted))
+                        DataRow("日期与时间", Display.dateTime(entry.date))
                         if entry.kind == .buy {
-                            DataRow("投入人民币", Display.money(entry.amountCNY))
+                            DataRow("投入美元", Display.money(entry.amountUSD))
+                            DataRow("原始人民币投入", Display.cny(entry.amountCNY))
                             DataRow("实际获得 BTC", "\(Display.btc(entry.receivedSats)) BTC")
                             DataRow("进入账户", store.accountName(entry.toAccountID))
                         } else {
@@ -58,12 +59,12 @@ struct RulesView: View {
             PanelHeader(title: "账目计算规则", onClose: onDismiss)
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    rule("购买", "每次只记录人民币实际投入、BTC 实际获得和存入账户。累计投入人民币与累计购买 BTC 分别为所有购买记录之和。")
-                    rule("转移", "来源账户减去转出 BTC，目标账户加上实际到账 BTC。BTC 损耗 = 转出 − 到账；转移不增加人民币投入。")
-                    rule("总持有与综合成本", "总持有 BTC = 累计购买 BTC − 累计损耗 BTC，也等于各账户余额之和。综合成本 = 累计投入人民币 ÷ 总持有 BTC，转移损耗包含在综合成本内。")
-                    rule("市值与盈亏", "当前总市值 = 总持有 BTC × 当前 BTC 市价。总盈亏 = 当前总市值 − 累计投入人民币。总盈亏率 = 总盈亏 ÷ 累计投入人民币；没有分母时显示 —。")
+                    rule("购买", "输入人民币实际投入、BTC 实际获得和存入账户。保存时按购买时间可用的历史日参考汇率换算并固定美元投入；人民币原值保留。汇率不可可靠取得时保留草稿，不保存新记录。")
+                    rule("转移", "来源账户减去转出 BTC，目标账户加上实际到账 BTC。BTC 损耗 = 转出 − 到账；转移不增加投入。")
+                    rule("总持有与综合成本", "总持有 BTC = 累计购买 BTC − 累计损耗 BTC，也等于各账户余额之和。综合成本 = 累计投入美元 ÷ 总持有 BTC，转移损耗包含在综合成本内。")
+                    rule("市值与盈亏", "行情、投入、综合成本、市值及盈亏统一显示美元。当前总市值 = 总持有 BTC × 当前 BTC 市价；总盈亏 = 当前总市值 − 累计投入美元；总盈亏率 = 总盈亏 ÷ 累计投入美元。缺少可靠换算或分母时显示 —。")
                     rule("K 线与历史状态", "市场 K 线叠加综合成本走势及购买、转移标记。鼠标指向历史时，持有量、投入、损耗、成本及盈亏都按截止该时间的记录计算。")
-                    rule("修改与本地备份", "记录按日期及同时间录入顺序重算。编辑、删除或导入导致历史账户余额不足时不会保存。BTC 精确到 1 satoshi。账本只保存在此 Mac；JSON 可完整恢复，CSV 供查看历史记录。")
+                    rule("修改与本地备份", "时间输入和显示精确到分钟，采用上海时区；历史时间保留原精度。修改购买时间或人民币投入会重新取得历史汇率；只修改 BTC 或账户时保留原美元投入。记录按时间及同时间录入顺序重算；历史账户余额不足时不会保存。BTC 精确到 1 satoshi。账本仅保存在此 Mac；JSON 可完整恢复，CSV 供查看历史记录。")
                 }.padding(.horizontal, 20).padding(.vertical, 12)
             }.frame(minHeight: 0, maxHeight: .infinity)
             Divider()

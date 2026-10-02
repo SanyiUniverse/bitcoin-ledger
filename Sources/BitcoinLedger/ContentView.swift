@@ -79,95 +79,189 @@ struct ContentView: View {
     }
 }
 
+enum DashboardMetric: String, CaseIterable, Identifiable {
+    case marketValue, invested, cost, profit, profitRatio, purchased, loss, currentPrice
+    static let storageKey = "dashboard.metricOrder.v1"
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .marketValue: "当前总市值"
+        case .invested: "累计投入"
+        case .cost: "综合成本"
+        case .profit: "总盈亏"
+        case .profitRatio: "总盈亏率"
+        case .purchased: "累计购买BTC"
+        case .loss: "累计损耗BTC"
+        case .currentPrice: "当前BTC市价"
+        }
+    }
+    static func ordered(from raw: String) -> [Self] {
+        var seen = Set<Self>()
+        let stored = raw.split(separator: ",").compactMap { Self(rawValue: String($0)) }
+        return (stored + allCases).filter { seen.insert($0).inserted }
+    }
+    static func reordered(_ raw: String, moving source: Self, to target: Self) -> String {
+        var order = ordered(from: raw)
+        guard source != target, let sourceIndex = order.firstIndex(of: source), let targetIndex = order.firstIndex(of: target) else {
+            return order.map(\.rawValue).joined(separator: ",")
+        }
+        order.remove(at: sourceIndex)
+        order.insert(source, at: targetIndex)
+        return order.map(\.rawValue).joined(separator: ",")
+    }
+    static func profitColor(_ value: Decimal?) -> Color {
+        guard let value, value != 0 else { return .primary }
+        return value > 0 ? .green : .red
+    }
+}
+
+/// Only a token issued by the active local drag can reorder a metric.
+struct DashboardMetricDrag {
+    let metric: DashboardMetric
+    let token: String
+    init(_ metric: DashboardMetric) {
+        self.metric = metric
+        token = "BitcoinLedger.metric.\(metric.rawValue).\(UUID().uuidString)"
+    }
+    func itemProvider() -> NSItemProvider { NSItemProvider(object: token as NSString) }
+    func reordered(_ tokens: [String], rawOrder: String, target: DashboardMetric) -> String? {
+        guard tokens.count == 1, tokens.first == token else { return nil }
+        return DashboardMetric.reordered(rawOrder, moving: metric, to: target)
+    }
+}
+
 struct DashboardView: View {
     @EnvironmentObject private var store: AppStore
     @State private var showLocations = false
+    @State private var expandedChart = false
+    @State private var activeMetricDrag: DashboardMetricDrag?
+    @AppStorage(DashboardMetric.storageKey) private var metricOrder = ""
     let onAdd: (EntryKind) -> Void
 
     var body: some View {
         GeometryReader { geometry in
             let compact = geometry.size.width < 650
-            let row = compact ? AnyLayout(VStackLayout(alignment: .leading, spacing: 16))
-                : AnyLayout(HStackLayout(alignment: .top, spacing: 16))
+            let padding: CGFloat = compact ? 12 : 16
+            // Small windows remain readable; normal windows fit the dashboard.
+            let scrollNeeded = expandedChart || geometry.size.height < (compact ? 540 : 440)
             ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 12) {
                     if let notice = store.migrationNotice {
                         Label(notice, systemImage: "exclamationmark.triangle")
                             .font(.callout).foregroundStyle(.orange).textSelection(.enabled)
                     }
                     if let state = store.snapshot {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("总持有 BTC").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                            Button { showLocations.toggle() } label: {
-                                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                                    Text(Display.btc(state.totalSats)).font(.system(size: 40, weight: .semibold, design: .rounded)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.6)
-                                    Text("BTC").font(.title3).foregroundStyle(.secondary)
-                                    Image(systemName: showLocations ? "chevron.up" : "chevron.down").font(.headline).foregroundStyle(.secondary)
-                                    Spacer(minLength: 0)
-                                }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-                            }.buttonStyle(.plain)
-                            .accessibilityLabel("Bitcoin 总持有量 \(Display.btc(state.totalSats)) BTC，\(showLocations ? "收起" : "查看")账户余额")
-                            .accessibilityIdentifier("dashboard.balance")
-                            Text(showLocations ? "点击收起账户余额" : "点击总持有 BTC 查看账户余额").font(.caption).foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack(alignment: .center, spacing: compact ? 10 : 16) {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("总持有 BTC").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                    Button { showLocations.toggle() } label: {
+                                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                            Text(Display.btc(state.totalSats)).font(.system(size: 36, weight: .semibold, design: .rounded)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.6)
+                                            Text("BTC").font(.title3).foregroundStyle(.secondary)
+                                            Image(systemName: showLocations ? "chevron.up" : "chevron.down").font(.headline).foregroundStyle(.secondary)
+                                            Spacer(minLength: 0)
+                                        }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                                    }.buttonStyle(.plain)
+                                    .accessibilityLabel("Bitcoin 总持有量 \(Display.btc(state.totalSats)) BTC，\(showLocations ? "收起" : "查看")账户余额")
+                                    .accessibilityIdentifier("dashboard.balance")
+                                    .help("点击总持有 BTC 查看或收起账户余额")
+                                    HStack(spacing: 8) {
+                                        LedgerActionButton(title: "购买", icon: "bitcoinsign.circle") { onAdd(.buy) }
+                                            .accessibilityIdentifier("dashboard.buy")
+                                        LedgerActionButton(title: "转移", icon: "arrow.left.arrow.right.circle") { onAdd(.transfer) }
+                                            .accessibilityIdentifier("dashboard.transfer")
+                                    }.disabled(!store.canEdit || store.accounts.isEmpty)
+                                }.frame(width: compact ? 180 : 250, alignment: .leading)
+                                Divider()
+                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 85), spacing: 8, alignment: .leading)],
+                                          alignment: .leading, spacing: 8) {
+                                    ForEach(DashboardMetric.ordered(from: metricOrder)) { metric in
+                                        metricCell(metric, state: state)
+                                    }
+                                }.frame(maxWidth: .infinity, alignment: .leading)
+                            }
                             if showLocations {
-                                VStack(alignment: .leading, spacing: 12) {
+                                VStack(alignment: .leading, spacing: 8) {
                                     ForEach(store.accounts) { account in
                                         DataRow(account.name, "\(Display.btc(state.balances[account.id] ?? 0)) BTC")
                                     }
-                                }.padding(.vertical, 12)
+                                }.padding(.vertical, 4)
                                 .accessibilityIdentifier("dashboard.accounts")
-                                Divider()
                             }
-                            row {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text("当前总市值").font(.caption).foregroundStyle(.secondary)
-                                    Text(Display.money(store.quote.map { state.value(price: $0.priceCNY) })).font(.title2).monospacedDigit()
-                                }
-                                HStack {
-                                    VStack(alignment: compact ? .leading : .trailing, spacing: 4) {
-                                        Text("当前 BTC 市价 \(Display.money(store.quote?.priceCNY))").font(.subheadline).monospacedDigit()
-                                        if let quote = store.quote {
-                                            Text("获取于 \(quote.fetchedAt.formatted(date: .abbreviated, time: .shortened)) · \(quote.source)").font(.caption).foregroundStyle(.secondary)
-                                            if Date().timeIntervalSince(quote.fetchedAt) > 900 { Text("缓存价格，等待刷新").font(.caption).foregroundStyle(.orange) }
-                                        } else { Text("联网后显示参考行情").font(.caption).foregroundStyle(.secondary) }
-                                    }
-                                    Button { Task { await store.refreshPrice(force: true) } } label: { Image(systemName: "arrow.clockwise") }
-                                        .disabled(store.refreshing).help("刷新价格（每分钟最多一次）")
-                                }.frame(maxWidth: .infinity, alignment: compact ? .leading : .trailing)
-                            }
-                            if let error = store.priceError { Text(error).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
-                        }.padding(24).background(.background, in: RoundedRectangle(cornerRadius: 16))
-                        row {
-                            HStack(spacing: 8) {
-                                LedgerActionButton(title: "购买", icon: "bitcoinsign.circle") { onAdd(.buy) }
-                                    .accessibilityIdentifier("dashboard.buy")
-                                LedgerActionButton(title: "转移", icon: "arrow.left.arrow.right.circle") { onAdd(.transfer) }
-                                    .accessibilityIdentifier("dashboard.transfer")
-                            }.fixedSize(horizontal: true, vertical: false)
-                                .disabled(!store.canEdit || store.accounts.isEmpty)
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 14, alignment: .leading)],
-                                      alignment: .leading, spacing: 12) {
-                                metric("累计投入人民币", Display.money(state.totalInvestedCNY))
-                                metric("综合成本 ¥/BTC", Display.money(state.averageCostCNY))
-                                metric("累计购买 BTC", Display.btc(state.totalPurchasedSats))
-                                metric("累计损耗 BTC", Display.btc(state.totalLossSats))
-                                metric("总盈亏", Display.money(store.quote.map { state.profit(price: $0.priceCNY) }))
-                                metric("总盈亏率", Display.percent(store.quote.flatMap { state.profitRatio(price: $0.priceCNY) }))
-                            }.textSelection(.enabled)
-                        }
-                        BTCChartView()
+                            if let error = store.priceError { Text(error).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled) }
+                        }.padding(12).background(.background, in: RoundedRectangle(cornerRadius: 16))
+                            .fixedSize(horizontal: false, vertical: true)
+                        BTCChartView(expandedChart: $expandedChart)
+                            .frame(maxWidth: .infinity, maxHeight: expandedChart ? nil : .infinity)
                     }
-                }.padding(compact ? 20 : 28).frame(maxWidth: 1150)
-            }.background(Color(nsColor: .windowBackgroundColor))
+                }
+                .frame(height: scrollNeeded ? nil : max(0, geometry.size.height - padding * 2), alignment: .top)
+                .padding(padding).frame(maxWidth: 1150)
+            }
+            .scrollDisabled(!scrollNeeded)
+            .background(Color(nsColor: .windowBackgroundColor))
         }
     }
 
-    private func metric(_ title: String, _ value: String) -> some View {
+    private func metricCell(_ metric: DashboardMetric, state: LedgerSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.caption).foregroundStyle(.secondary)
-            Text(value).font(.subheadline.weight(.medium)).monospacedDigit()
-                .lineLimit(1).minimumScaleFactor(0.7)
-        }.frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 4) {
+                Text(metric.title).font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if metric == .currentPrice {
+                    Button { Task { await store.refreshPrice(force: true) } } label: { Image(systemName: "arrow.clockwise").font(.caption2) }
+                        .buttonStyle(.plain).disabled(store.refreshing)
+                        .accessibilityIdentifier("dashboard.quoteRefresh")
+                        .help("刷新价格（每分钟最多一次）")
+                }
+            }
+            Text(metricValue(metric, state: state)).font(.caption.weight(.medium)).monospacedDigit()
+                .foregroundStyle(metricColor(metric, state: state))
+                .fixedSize(horizontal: false, vertical: true)
+            if metric == .currentPrice, let quote = store.quote, Date().timeIntervalSince(quote.fetchedAt) > 900 {
+                Text("缓存价格，等待刷新").font(.caption2).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .accessibilityIdentifier("dashboard.metric.\(metric.rawValue)")
+        .help(metric == .currentPrice ? quoteHelp : "拖动调整指标顺序")
+        .onDrag {
+            let drag = DashboardMetricDrag(metric)
+            activeMetricDrag = drag
+            return drag.itemProvider()
+        }
+        .dropDestination(for: String.self) { tokens, _ in
+            defer { activeMetricDrag = nil }
+            guard let reordered = activeMetricDrag?.reordered(tokens, rawOrder: metricOrder, target: metric) else { return false }
+            metricOrder = reordered
+            return true
+        }
+    }
+    private var quoteHelp: String {
+        guard let quote = store.quote else { return "联网后显示参考行情；拖动调整指标顺序" }
+        return "美元参考行情 · 获取于 \(Display.dateTime(quote.fetchedAt)) · \(quote.source)；拖动调整指标顺序"
+    }
+    private func metricValue(_ metric: DashboardMetric, state: LedgerSnapshot) -> String {
+        switch metric {
+        case .marketValue: Display.money(store.quote.map { state.value(price: $0.priceUSD) })
+        case .invested: Display.money(state.totalInvestedUSD)
+        case .cost: Display.money(state.averageCostUSD) + "/BTC"
+        case .profit: Display.money(store.quote.flatMap { state.profit(price: $0.priceUSD) })
+        case .profitRatio: Display.percent(store.quote.flatMap { state.profitRatio(price: $0.priceUSD) })
+        case .purchased: Display.btc(state.totalPurchasedSats)
+        case .loss: Display.btc(state.totalLossSats)
+        case .currentPrice: Display.money(store.quote?.priceUSD)
+        }
+    }
+    private func metricColor(_ metric: DashboardMetric, state: LedgerSnapshot) -> Color {
+        switch metric {
+        case .profit: DashboardMetric.profitColor(store.quote.flatMap { state.profit(price: $0.priceUSD) })
+        case .profitRatio: DashboardMetric.profitColor(store.quote.flatMap { state.profitRatio(price: $0.priceUSD) })
+        default: .primary
+        }
     }
 }
 
@@ -178,7 +272,7 @@ struct LedgerActionButton: View {
     var body: some View {
         Button(action: action) {
             Label(title, systemImage: icon).font(.subheadline.weight(.semibold))
-        }.buttonStyle(.borderedProminent).controlSize(.regular)
+        }.buttonStyle(.borderedProminent).controlSize(.small)
     }
 }
 
@@ -201,13 +295,14 @@ struct EntryRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(entry.kind.title).font(.headline)
                 Text(accountLabel).foregroundStyle(.secondary)
-                Text(entry.date.formatted(date: .numeric, time: .omitted)).font(.caption).foregroundStyle(.secondary)
+                Text(Display.dateTime(entry.date)).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 4) {
                 if entry.kind == .buy {
                     Text("+\(Display.btc(entry.receivedSats)) BTC").monospacedDigit()
-                    Text("投入 \(Display.money(entry.amountCNY))").font(.caption).foregroundStyle(.secondary)
+                    Text("投入 \(Display.money(entry.amountUSD)) · 原 \(Display.cny(entry.amountCNY))")
+                        .font(.caption).foregroundStyle(.secondary)
                 } else {
                     Text("转出 \(Display.btc(entry.amountSats)) BTC").monospacedDigit()
                     Text("到账 \(Display.btc(entry.receivedSats)) BTC").font(.caption).foregroundStyle(.secondary)

@@ -4,14 +4,14 @@ import Testing
 
 private let marketTestNow = Date(timeIntervalSince1970: 1_790_899_200)
 
-private func yahooFixture(times: [Int64], open: [String], high: [String], low: [String], close: [String], currency: String = "CNY") -> Data {
+private func yahooFixture(times: [Int64], open: [String], high: [String], low: [String], close: [String], currency: String = "USD") -> Data {
     Data("""
     {"chart":{"error":null,"result":[{"meta":{"currency":"\(currency)"},"timestamp":[\(times.map(String.init).joined(separator: ","))],"indicators":{"quote":[{"open":[\(open.joined(separator: ","))],"high":[\(high.joined(separator: ","))],"low":[\(low.joined(separator: ","))],"close":[\(close.joined(separator: ","))]}]}}]}}
     """.utf8)
 }
 private let dailyStart: Int64 = 1_790_726_400
 
-@Test func realCNYOHLCParsingPreservesDecimalsAndDailyCloseTime() throws {
+@Test func realUSDOHLCParsingPreservesDecimalsAndDailyCloseTime() throws {
     let data = yahooFixture(times: [dailyStart, dailyStart + 86_400],
         open: ["564032.12345678", "567419"], high: ["571130.3", "569001"],
         low: ["563660.2", "566356"], close: ["567362.01", "568838"])
@@ -33,7 +33,7 @@ private let dailyStart: Int64 = 1_790_726_400
         yahooFixture(times: [dailyStart, dailyStart], open: ["10", "10"], high: ["12", "12"], low: ["8", "8"], close: ["9", "9"]),
         yahooFixture(times: [dailyStart + 3 * 86_400], open: ["10"], high: ["12"], low: ["8"], close: ["9"]),
         yahooFixture(times: [dailyStart + 1], open: ["10"], high: ["12"], low: ["8"], close: ["9"]),
-        yahooFixture(times: [dailyStart], open: ["10"], high: ["12"], low: ["8"], close: ["9"], currency: "USD")]
+        yahooFixture(times: [dailyStart], open: ["10"], high: ["12"], low: ["8"], close: ["9"], currency: "CNY")]
     for fixture in malformed {
         #expect(throws: (any Error).self) { try MarketHistoryClient.decodeYahoo(data: fixture, fetchedAt: marketTestNow) }
     }
@@ -46,7 +46,6 @@ private let dailyStart: Int64 = 1_790_726_400
     #expect(!candle.hasOHLC)
     #expect(candle.close == 12)
     #expect(candle.open == 12 && candle.high == 12 && candle.low == 12)
-    #expect(history.isReferenceCNY)
     #expect(history.source.contains("真实收盘"))
 }
 
@@ -73,7 +72,7 @@ private let dailyStart: Int64 = 1_790_726_400
     #expect(try JSONDecoder().decode(MarketHistory.self, from: JSONEncoder().encode(history)) == history)
     let endpoint = MarketHistoryClient.yahooEndpoint(through: marketTestNow)
     #expect(endpoint.host == "query1.finance.yahoo.com")
-    #expect(endpoint.path == "/v8/finance/chart/BTC-CNY")
+    #expect(endpoint.path == "/v8/finance/chart/BTC-USD")
     #expect(endpoint.query == "interval=1d&period1=0&period2=1790899201")
 }
 
@@ -101,8 +100,8 @@ private let dailyStart: Int64 = 1_790_726_400
 @Test func fullTimelineStartsAtGenesisWithoutFabricatingPricesBeforeFirstMarket() {
     #expect(MarketRange.all.startDate(today: marketTestNow) == Date(timeIntervalSince1970: 1_230_940_800))
     #expect(MarketRange.all.days > 6_000)
-    #expect(MarketRange.allCases.map(\.title) == ["7 天", "30 天", "90 天", "180 天", "1 年", "3 年", "全部"])
-    #expect(MarketPeriod.allCases.map(\.title) == ["日 K", "周 K", "月 K"])
+    #expect(MarketRange.allCases.map(\.title) == ["1 小时", "1 天", "7 天", "30 天", "90 天", "180 天", "1 年", "3 年", "全部"])
+    #expect(MarketPeriod.allCases.map(\.title) == ["1 分钟", "3 分钟", "5 分钟", "15 分钟", "30 分钟", "1 小时", "2 小时", "4 小时", "6 小时", "8 小时", "12 小时", "日 K", "3 日", "周 K", "月 K", "3 月", "年 K"])
 }
 
 private func day(_ text: String) -> Date { ISO8601DateFormatter().date(from: text + "T00:00:00Z")! }
@@ -198,8 +197,7 @@ private func dailyCandle(_ start: Date, open: Decimal, high: Decimal, low: Decim
     #expect(merged.candles.count == 3)
     #expect(merged.candles[1] == yahoo)
     #expect(!merged.candles[0].hasOHLC && !merged.candles[2].hasOHLC)
-    #expect(merged.isReferenceCNY)
-    #expect(merged.source.contains("ECB"))
+    #expect(merged.source.contains("CoinMetrics PriceUSD"))
 }
 
 private final class HistoryFailureProtocol: URLProtocol, @unchecked Sendable {
@@ -224,44 +222,54 @@ private final class HistoryFailureProtocol: URLProtocol, @unchecked Sendable {
     }
 }
 
+@Test func minuteNetworkFailuresAreExplicit() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [HistoryFailureProtocol.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    await #expect(throws: MarketHistoryError.httpStatus(429)) {
+        try await MarketHistoryClient(session: session).fetchMinutes()
+    }
+}
+
 @Test func dynamicCostIncludesEverySameDayEventAndUsesCutoffLedgerState() throws {
     let exchange = Account(name: "欧易")
     let wallet = Account(name: "自有钱包")
     let firstDate = marketTestNow.addingTimeInterval(-14_400)
     let secondDate = firstDate.addingTimeInterval(3600)
     let transferDate = secondDate.addingTimeInterval(3600)
-    let purchase = LedgerEntry(date: firstDate, sequence: 1, kind: .buy, toAccountID: exchange.id, amountSats: 1_000_000, amountCNY: 1000)
-    let second = LedgerEntry(date: secondDate, sequence: 2, kind: .buy, toAccountID: exchange.id, amountSats: 1_000_000, amountCNY: 2000)
-    let transfer = LedgerEntry(date: transferDate, sequence: 3, kind: .transfer, fromAccountID: exchange.id, toAccountID: wallet.id, amountSats: 1_000_000, receivedSats: 995_000)
+    let purchase = syntheticEntry(date: firstDate, sequence: 1, kind: .buy, toAccountID: exchange.id, amountSats: 1_000_000, amountCNY: 1000)
+    let second = syntheticEntry(date: secondDate, sequence: 2, kind: .buy, toAccountID: exchange.id, amountSats: 1_000_000, amountCNY: 2000)
+    let transfer = syntheticEntry(date: transferDate, sequence: 3, kind: .transfer, fromAccountID: exchange.id, toAccountID: wallet.id, amountSats: 1_000_000, receivedSats: 995_000)
     let accounts = [exchange, wallet]
     let entries = [transfer, second, purchase]
     let old = try LedgerEngine.calculate(accounts: accounts, entries: entries, asOf: firstDate.addingTimeInterval(1))
-    #expect(old.totalInvestedCNY == 1000)
+    #expect(old.totalInvestedUSD == 1000)
     #expect(old.totalSats == 1_000_000)
     #expect(old.totalLossSats == 0)
     #expect(old.profit(price: 200_000) == 1000)
     let points = try LedgerChartHistory.costPoints(accounts: accounts, entries: entries, from: firstDate.addingTimeInterval(-1), through: marketTestNow)
-    #expect(points.filter { $0.date == secondDate }.map(\.costCNY) == [100_000, 150_000])
+    #expect(points.filter { $0.date == secondDate }.map(\.costUSD) == [100_000, 150_000])
     let transferred = try LedgerEngine.calculate(accounts: accounts, entries: entries, asOf: transferDate)
-    #expect(points.filter { $0.date == transferDate }.map(\.costCNY) == [150_000, transferred.averageCostCNY!])
+    #expect(points.filter { $0.date == transferDate }.map(\.costUSD) == [150_000, transferred.averageCostUSD!])
     #expect(transferred.totalLossSats == 5000)
     #expect(transferred.totalSats == 1_995_000)
-    #expect(transferred.averageCostCNY! > 150_000)
+    #expect(transferred.averageCostUSD! > 150_000)
 }
 
 @Test func everyEventHasMarkerEvenWhenHoldingIsExhaustedBeforeFirstClose() throws {
     let exchange = Account(name: "欧易")
     let wallet = Account(name: "自有钱包")
     let candle = MarketCandle(closeDate: marketTestNow, interval: 345_600, open: 100_000, high: 120_000, low: 90_000, close: 110_000)
-    let purchase = LedgerEntry(date: candle.startDate.addingTimeInterval(3600), sequence: 1, kind: .buy,
+    let purchase = syntheticEntry(date: candle.startDate.addingTimeInterval(3600), sequence: 1, kind: .buy,
                                toAccountID: exchange.id, amountSats: 1_000_000, amountCNY: 1000)
-    let loss = LedgerEntry(date: purchase.date.addingTimeInterval(3600), sequence: 2, kind: .transfer,
+    let loss = syntheticEntry(date: purchase.date.addingTimeInterval(3600), sequence: 2, kind: .transfer,
                           fromAccountID: exchange.id, toAccountID: wallet.id, amountSats: 1_000_000, receivedSats: 0)
     let history = MarketHistory(range: .year, fetchedAt: marketTestNow, candles: [candle])
     let markers = try LedgerChartHistory.events(accounts: [exchange, wallet], entries: [purchase, loss],
                                                history: history, from: candle.startDate, through: candle.closeDate)
     #expect(markers.map(\.id) == [purchase.id, loss.id])
-    #expect(markers[1].markerPriceCNY == 100_000)
+    #expect(markers[1].markerPriceUSD == 100_000)
     #expect(history.latestClose(asOf: loss.date) == nil)
 }
 

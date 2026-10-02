@@ -24,8 +24,8 @@ public struct MigrationReport: Codable, Equatable, Sendable {
 }
 
 public struct BackupDocument: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 4
-    public static let supportedAccountingPolicy = "cny-invested-net-btc-v1"
+    public static let currentSchemaVersion = 5
+    public static let supportedAccountingPolicy = "usd-invested-net-btc-v1"
     public var schemaVersion: Int
     public var baseCurrency: String
     public var accountingPolicy: String
@@ -37,7 +37,7 @@ public struct BackupDocument: Codable, Equatable, Sendable {
 
     public init(schemaVersion: Int = Self.currentSchemaVersion, exportedAt: Date = Date(),
                 accounts: [Account] = Account.defaults, entries: [LedgerEntry] = [],
-                lastPrice: PriceQuote? = nil, baseCurrency: String = "CNY",
+                lastPrice: PriceQuote? = nil, baseCurrency: String = "USD",
                 accountingPolicy: String = Self.supportedAccountingPolicy,
                 migrationReport: MigrationReport? = nil) {
         self.schemaVersion = schemaVersion
@@ -94,8 +94,10 @@ public enum BackupCodec {
         guard header.schemaVersion == 1 || (header.baseCurrency != nil && header.accountingPolicy != nil) else {
             throw BackupError.invalidDocument("备份缺少本位币或记账口径。")
         }
-        guard header.baseCurrency ?? "CNY" == "CNY" else { throw BackupError.invalidDocument("本位币必须为 CNY。") }
-        let supportedPolicy = header.schemaVersion < 4 ? legacyPolicy : BackupDocument.supportedAccountingPolicy
+        let currency = header.schemaVersion < 5 ? "CNY" : "USD"
+        guard header.baseCurrency ?? currency == currency else { throw BackupError.invalidDocument("备份本位币与版本不一致。") }
+        let supportedPolicy = header.schemaVersion < 4 ? legacyPolicy : header.schemaVersion == 4
+            ? "cny-invested-net-btc-v1" : BackupDocument.supportedAccountingPolicy
         guard header.accountingPolicy ?? supportedPolicy == supportedPolicy else {
             throw BackupError.unsupportedAccountingPolicy(header.accountingPolicy ?? "")
         }
@@ -121,9 +123,20 @@ public enum BackupCodec {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .millisecondsSince1970
         do {
-            let document = version == 4
-                ? try decoder.decode(BackupDocument.self, from: data)
-                : try migrate(decoder.decode(LegacyDocument.self, from: data))
+            let document: BackupDocument
+            if version == 5 { document = try decoder.decode(BackupDocument.self, from: data) }
+            else if version == 4 {
+                let old = try decoder.decode(PreviousBTCOnlyDocument.self, from: data)
+                // CNY quotes cannot be relabelled USD. Retain purchase inputs;
+                // missing conversions stay explicit until historical FX loads.
+                let entries = old.entries.map { entry in
+                    var original = entry
+                    original.conversion = nil
+                    return original
+                }
+                document = BackupDocument(exportedAt: old.exportedAt, accounts: old.accounts,
+                    entries: entries, migrationReport: old.migrationReport)
+            } else { document = try migrate(decoder.decode(LegacyDocument.self, from: data)) }
             try validate(document)
             return document
         } catch let error as BackupError { throw error }
@@ -134,7 +147,7 @@ public enum BackupCodec {
         guard document.schemaVersion == BackupDocument.currentSchemaVersion else {
             throw BackupError.unsupportedSchema(document.schemaVersion)
         }
-        guard document.baseCurrency == "CNY" else { throw BackupError.invalidDocument("本位币必须为 CNY。") }
+        guard document.baseCurrency == "USD" else { throw BackupError.invalidDocument("本位币必须为 USD。") }
         guard document.accountingPolicy == BackupDocument.supportedAccountingPolicy else {
             throw BackupError.unsupportedAccountingPolicy(document.accountingPolicy)
         }
@@ -142,7 +155,7 @@ public enum BackupCodec {
             throw BackupError.invalidDocument("导出日期无效。")
         }
         if let quote = document.lastPrice {
-            guard quote.priceCNY > 0, quote.priceCNY <= Amounts.maximumPrice,
+            guard quote.priceUSD > 0, quote.priceUSD <= Amounts.maximumPrice,
                   quote.fetchedAt.timeIntervalSinceReferenceDate.isFinite,
                   !quote.source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   quote.source.count <= 200 else { throw BackupError.invalidDocument("缓存行情无效。") }
@@ -169,7 +182,7 @@ public enum BackupCodec {
         let names = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0.name) })
         var rows = [["id", "date_utc", "sequence", "kind", "from_account_id", "from_account_name",
                      "to_account_id", "to_account_name", "amount_sats", "amount_btc", "received_sats",
-                     "received_btc", "amount_cny", "loss_sats", "loss_btc", "note"]]
+                     "received_btc", "amount_cny", "amount_usd", "cny_per_usd", "fx_date_utc", "fx_source", "loss_sats", "loss_btc", "note"]]
         for entry in LedgerEngine.ordered(entries) {
             rows.append([
                 entry.id.uuidString, timestamp(entry.date), String(entry.sequence), entry.kind.rawValue,
@@ -177,7 +190,11 @@ public enum BackupCodec {
                 entry.toAccountID?.uuidString ?? "", safeText(entry.toAccountID.flatMap { names[$0] } ?? ""),
                 String(entry.amountSats), Amounts.string(Amounts.btc(entry.amountSats)),
                 String(entry.receivedSats), Amounts.string(Amounts.btc(entry.receivedSats)),
-                Amounts.string(entry.amountCNY), String(entry.lossSats), Amounts.string(Amounts.btc(entry.lossSats)), safeText(entry.note)
+                Amounts.string(entry.amountCNY), entry.amountUSD.map(Amounts.string) ?? "",
+                entry.conversion.map { Amounts.string($0.rate.cnyPerUSD) } ?? "",
+                entry.conversion.map { timestamp($0.rate.date) } ?? "",
+                safeText(entry.conversion?.rate.source ?? ""),
+                String(entry.lossSats), Amounts.string(Amounts.btc(entry.lossSats)), safeText(entry.note)
             ])
         }
         let csv = "\u{FEFF}" + rows.map { $0.map(escapeCSV).joined(separator: ",") }.joined(separator: "\r\n") + "\r\n"
@@ -217,7 +234,12 @@ private struct LegacyDocument: Decodable {
     var exportedAt: Date
     var accounts: [LegacyAccount]
     var entries: [LegacyEntry]
-    var lastPrice: PriceQuote?
+}
+private struct PreviousBTCOnlyDocument: Decodable {
+    var exportedAt: Date
+    var accounts: [Account]
+    var entries: [LedgerEntry]
+    var migrationReport: MigrationReport?
 }
 private struct LegacyEntry: Decodable {
     var id: UUID
@@ -378,7 +400,7 @@ private extension BackupCodec {
             }
         }
         return BackupDocument(exportedAt: old.exportedAt, accounts: accounts, entries: entries,
-            lastPrice: old.lastPrice, migrationReport: MigrationReport(sourceSchemaVersion: old.schemaVersion,
+            migrationReport: MigrationReport(sourceSchemaVersion: old.schemaVersion,
                 sourceEntryCount: old.entries.count, migratedCount: entries.count, mappings: mappings, issues: issues))
     }
 

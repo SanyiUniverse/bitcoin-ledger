@@ -1,14 +1,57 @@
 import SwiftUI
+import AppKit
 import LedgerCore
+
+/// Native minute-level entry preserves the Date binding's existing precision.
+struct LedgerDateTimePicker: NSViewRepresentable {
+    @Binding var date: Date
+    var isEnabled = true
+
+    static func minuteDate(_ date: Date) -> Date {
+        Date(timeIntervalSince1970: (date.timeIntervalSince1970 / 60).rounded(.down) * 60)
+    }
+
+    func makeNSView(context: Context) -> NSDatePicker {
+        let picker = NSDatePicker()
+        picker.datePickerStyle = .textFieldAndStepper
+        picker.datePickerElements = [.yearMonthDay, .hourMinute]
+        picker.datePickerMode = .single
+        picker.locale = Locale(identifier: "zh_CN")
+        picker.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        picker.target = context.coordinator
+        picker.action = #selector(Coordinator.changed(_:))
+        picker.setAccessibilityIdentifier("entry.date")
+        return picker
+    }
+    func updateNSView(_ picker: NSDatePicker, context: Context) {
+        context.coordinator.parent = self
+        if picker.dateValue != date { picker.dateValue = date }
+        picker.isEnabled = isEnabled
+    }
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    @MainActor final class Coordinator: NSObject {
+        var parent: LedgerDateTimePicker
+        init(_ parent: LedgerDateTimePicker) { self.parent = parent }
+        @objc func changed(_ picker: NSDatePicker) {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(identifier: "Asia/Shanghai")!
+            // Reconfirming the visible minute must not erase hidden historical precision.
+            guard calendar.dateInterval(of: .minute, for: picker.dateValue)?.start
+                    != calendar.dateInterval(of: .minute, for: parent.date)?.start else { return }
+            parent.date = LedgerDateTimePicker.minuteDate(picker.dateValue)
+        }
+    }
+}
 
 struct EntryEditor: View {
     @EnvironmentObject private var store: AppStore
     let kind: EntryKind
     let existing: LedgerEntry?
+    @Binding var saveTask: Task<Void, Never>?
     let onDismiss: () -> Void
     @FocusState private var amountFocused: Bool
     @State private var entryID = UUID()
-    @State private var date = Date()
+    @State private var date = LedgerDateTimePicker.minuteDate(Date())
     @State private var from: UUID?
     @State private var to: UUID?
     @State private var cny = ""
@@ -16,6 +59,7 @@ struct EntryEditor: View {
     @State private var received = ""
     @State private var note = ""
     @State private var error: String?
+    @State private var isSaving = false
 
     private var transferLoss: Int64? {
         guard let outgoing = try? Amounts.satoshis(btc), let incoming = try? Amounts.satoshis(received), outgoing >= incoming else { return nil }
@@ -24,13 +68,14 @@ struct EntryEditor: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            PanelHeader(title: existing == nil ? kind.title : "编辑\(kind.title)", onClose: onDismiss)
+            PanelHeader(title: existing == nil ? kind.title : "编辑\(kind.title)", onClose: dismiss)
                 .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
             Divider()
             Form {
                 Section {
-                    DatePicker("日期", selection: $date, in: ...Date(), displayedComponents: [.date])
-                        .accessibilityIdentifier("entry.date")
+                    LabeledContent("日期与时间") {
+                        LedgerDateTimePicker(date: $date, isEnabled: !isSaving).frame(minWidth: 230, minHeight: 24)
+                    }
                     if kind == .buy {
                         TextField("本次投入人民币 ¥", text: $cny).focused($amountFocused)
                             .accessibilityIdentifier("entry.cny")
@@ -53,15 +98,17 @@ struct EntryEditor: View {
                     }
                 }
                 Section {
-                    Text("BTC 最多 8 位小数 · 人民币最多 2 位").font(.caption).foregroundStyle(.secondary)
+                    Text(kind == .buy ? "人民币最多 2 位 · 按购买时间可用的日参考汇率固定美元投入" : "BTC 最多 8 位小数")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-            }.formStyle(.grouped).frame(minHeight: 0, maxHeight: .infinity)
+            }.formStyle(.grouped).disabled(isSaving).frame(minHeight: 0, maxHeight: .infinity)
             Divider()
             HStack {
                 Spacer()
-                Button("取消", action: onDismiss).accessibilityIdentifier("panel.cancel")
-                Button("保存记录") { save() }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
-                    .disabled(!store.canEdit).accessibilityIdentifier("panel.save")
+                if isSaving { ProgressView().controlSize(.small).accessibilityLabel("正在保存记录") }
+                Button("取消", action: dismiss).accessibilityIdentifier("panel.cancel")
+                Button(isSaving ? "正在保存…" : "保存记录") { save() }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
+                    .disabled(!store.canEdit || isSaving).accessibilityIdentifier("panel.save")
             }.controlSize(.large).padding(.horizontal, 20).padding(.vertical, 14)
                 .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -69,6 +116,7 @@ struct EntryEditor: View {
             Button("好", role: .cancel) { error = nil }
         } message: { Text(error ?? "") }
         .onAppear { load() }
+        .onDisappear { saveTask?.cancel() }
         .task { await Task.yield(); amountFocused = true }
     }
 
@@ -106,7 +154,26 @@ struct EntryEditor: View {
                            note: note.trimmingCharacters(in: .whitespacesAndNewlines))
     }
     private func save() {
-        do { try store.saveEntry(makeEntry()); onDismiss() }
+        guard !isSaving else { return }
+        do {
+            let draft = try makeEntry()
+            isSaving = true
+            saveTask = Task {
+                defer { isSaving = false; saveTask = nil }
+                do {
+                    try await store.saveEntryResolvingCurrency(draft)
+                    try Task.checkCancellation()
+                    onDismiss()
+                } catch is CancellationError {
+                } catch {
+                    if !Task.isCancelled { self.error = error.localizedDescription }
+                }
+            }
+        }
         catch { self.error = error.localizedDescription }
+    }
+    private func dismiss() {
+        saveTask?.cancel()
+        onDismiss()
     }
 }

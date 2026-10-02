@@ -27,11 +27,12 @@ struct LedgerPanelOverlay: View {
     let panel: LedgerPanel
     let onDismiss: () -> Void
     let onEdit: (LedgerEntry) -> Void
+    @State private var saveTask: Task<Void, Never>?
 
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                Button(action: onDismiss) {
+                Button(action: dismiss) {
                     Rectangle().fill(.black.opacity(0.25)).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -57,16 +58,22 @@ struct LedgerPanelOverlay: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .onDisappear { saveTask?.cancel() }
+    }
+
+    private func dismiss() {
+        saveTask?.cancel()
+        onDismiss()
     }
 
     @ViewBuilder private var content: some View {
         switch panel.destination {
         case .entry(let kind, let existing):
-            EntryEditor(kind: kind, existing: existing, onDismiss: onDismiss)
+            EntryEditor(kind: kind, existing: existing, saveTask: $saveTask, onDismiss: dismiss)
         case .detail(let entry):
-            EntryDetail(entry: entry, onEdit: { onEdit(entry) }, onDismiss: onDismiss)
+            EntryDetail(entry: entry, onEdit: { onEdit(entry) }, onDismiss: dismiss)
         case .rules:
-            RulesView(onDismiss: onDismiss)
+            RulesView(onDismiss: dismiss)
         }
     }
 }

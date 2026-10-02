@@ -8,10 +8,10 @@ private let wallet = Account.defaults[1]
 private let accounts = Account.defaults
 private func decimal(_ value: String) -> Decimal { Decimal(string: value)! }
 private func buy(_ sats: Int64, _ cny: Decimal, sequence: Int64 = 0, date: Date = epoch, to: Account = exchange) -> LedgerEntry {
-    LedgerEntry(date: date, sequence: sequence, kind: .buy, toAccountID: to.id, receivedSats: sats, amountCNY: cny)
+    syntheticEntry(date: date, sequence: sequence, kind: .buy, toAccountID: to.id, receivedSats: sats, amountCNY: cny)
 }
 private func transfer(_ out: Int64, _ received: Int64, sequence: Int64 = 1, date: Date = epoch, from: Account = exchange, to: Account = wallet) -> LedgerEntry {
-    LedgerEntry(date: date, sequence: sequence, kind: .transfer, fromAccountID: from.id, toAccountID: to.id,
+    syntheticEntry(date: date, sequence: sequence, kind: .transfer, fromAccountID: from.id, toAccountID: to.id,
                 amountSats: out, receivedSats: received)
 }
 private func compute(_ entries: [LedgerEntry], asOf: Date? = nil) throws -> LedgerSnapshot {
@@ -22,12 +22,12 @@ private func compute(_ entries: [LedgerEntry], asOf: Date? = nil) throws -> Ledg
 struct EngineTests {
     @Test func userPurchaseExample() throws {
         let result = try compute([buy(52_000, 500)])
-        #expect(result.totalInvestedCNY == 500)
+        #expect(result.totalInvestedUSD == 500)
         #expect(result.totalPurchasedSats == 52_000)
         #expect(result.totalLossSats == 0)
         #expect(result.totalSats == 52_000)
         #expect(result.balances[exchange.id] == 52_000)
-        #expect(result.averageCostCNY == decimal("961538.461538461538"))
+        #expect(result.averageCostUSD == decimal("961538.461538461538"))
     }
     @Test func userTransferExampleIncreasesCostWithoutInvestment() throws {
         let result = try compute([buy(1_000_000, 5_000), transfer(1_000_000, 995_000)])
@@ -36,14 +36,14 @@ struct EngineTests {
         #expect(result.totalPurchasedSats == 1_000_000)
         #expect(result.totalLossSats == 5_000)
         #expect(result.totalSats == 995_000)
-        #expect(result.totalInvestedCNY == 5_000)
-        #expect(result.averageCostCNY == decimal("502512.562814070352"))
+        #expect(result.totalInvestedUSD == 5_000)
+        #expect(result.averageCostUSD == decimal("502512.562814070352"))
     }
     @Test func weightedActualPurchasesIncludeAllConversionCost() throws {
         let result = try compute([buy(10_000_000, 10_000), buy(20_000_000, 40_000, sequence: 1)])
-        #expect(result.totalInvestedCNY == 50_000)
+        #expect(result.totalInvestedUSD == 50_000)
         #expect(result.totalPurchasedSats == 30_000_000)
-        #expect(result.averageCostCNY == decimal("166666.666666666667"))
+        #expect(result.averageCostUSD == decimal("166666.666666666667"))
     }
     @Test func reverseTransfersAndBalancesUseOnlyLoss() throws {
         let entries = [buy(200_000, 1_000), transfer(100_000, 99_800),
@@ -58,8 +58,8 @@ struct EngineTests {
     @Test func equalTransferLeavesCostUnchanged() throws {
         let before = try compute([buy(100_000, 500)])
         let after = try compute([buy(100_000, 500), transfer(100_000, 100_000)])
-        #expect(after.averageCostCNY == before.averageCostCNY)
-        #expect(after.totalInvestedCNY == before.totalInvestedCNY)
+        #expect(after.averageCostUSD == before.averageCostUSD)
+        #expect(after.totalInvestedUSD == before.totalInvestedUSD)
         #expect(after.totalLossSats == 0)
     }
     @Test func marketValueProfitAndRatioUseTotalInvestment() throws {
@@ -79,13 +79,13 @@ struct EngineTests {
         let secondDay = try compute(entries, asOf: secondDate)
         let today = try compute(entries)
         #expect(beforeAll.totalSats == 0)
-        #expect(firstDay.totalInvestedCNY == 500)
+        #expect(firstDay.totalInvestedUSD == 500)
         #expect(firstDay.totalSats == 100_000)
         #expect(firstDay.totalLossSats == 0)
-        #expect(firstDay.averageCostCNY == 500_000)
+        #expect(firstDay.averageCostUSD == 500_000)
         #expect(firstDay.profit(price: 600_000) == 100)
         #expect(secondDay.totalSats == 300_000)
-        #expect(secondDay.totalInvestedCNY == 1_700)
+        #expect(secondDay.totalInvestedUSD == 1_700)
         #expect(secondDay.totalLossSats == 0)
         #expect(today.totalLossSats == 1_000)
         #expect(today.totalSats == 299_000)
@@ -105,9 +105,10 @@ struct EngineTests {
         purchase.amountSats = 300_000
         purchase.receivedSats = 300_000
         purchase.amountCNY = 1_800
+        purchase.conversion = try PurchaseConversion.make(amountCNY: 1_800, rate: purchase.conversion!.rate)
         #expect(try compute([purchase, movement]).totalSats == 299_800)
         #expect(try compute([purchase]).totalLossSats == 0)
-        #expect(try compute([]).totalInvestedCNY == 0)
+        #expect(try compute([]).totalInvestedUSD == 0)
     }
     @Test func historicalOverdraftPreventsInvalidEditsAndDeletes() throws {
         let movement = transfer(100_000, 99_800)
@@ -119,14 +120,14 @@ struct EngineTests {
         let result = try compute([buy(100_000, 500), transfer(100_000, 0)])
         #expect(result.totalSats == 0)
         #expect(result.totalLossSats == 100_000)
-        #expect(result.totalInvestedCNY == 500)
-        #expect(result.averageCostCNY == nil)
+        #expect(result.totalInvestedUSD == 500)
+        #expect(result.averageCostUSD == nil)
         #expect(result.profit(price: 600_000) == -500)
         #expect(result.profitRatio(price: 600_000) == -1)
     }
     @Test func emptyRatiosAreUndefined() throws {
         let result = try compute([])
-        #expect(result.averageCostCNY == nil)
+        #expect(result.averageCostUSD == nil)
         #expect(result.profitRatio(price: 600_000) == nil)
         #expect(result.value(price: 600_000) == 0)
     }

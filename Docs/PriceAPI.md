@@ -1,27 +1,31 @@
-# BTC 人民币行情
+# BTC 美元行情
 
-## 来源与可得时间
+## 来源
 
-实时价格复用 [Blockchain.com Exchange Rates API](https://www.blockchain.com/explorer/_api/exchange_rates_api) 的 `https://blockchain.info/ticker`，读取 `CNY.last`。本机记录获取时间，服务未提供成交时间；五分钟自动刷新，手动至少间隔一分钟，失败保留最后成功价格。
+实时价格复用 [Blockchain.com Exchange Rates API](https://www.blockchain.com/explorer/_api/exchange_rates_api) 的 `https://blockchain.info/ticker`，读取 `USD.last`。服务不提供成交时间，界面注明获取时间。五分钟自动刷新，手动至少间隔一分钟；失败保留最后成功价格。
 
-2014-09-17 起的人民币日行情来自 [Yahoo Finance BTC-CNY](https://sg.finance.yahoo.com/quote/BTC-CNY/)，页面注明提供者 CoinMarketCap。匿名 JSON 使用 `query1.finance.yahoo.com/v8/finance/chart/BTC-CNY`，参数为 `interval=1d`、`period1=0` 和当前截止时间 `period2`。UTC 时间戳标记日开始：完整收盘在下一午夜才可用于估值，当天行情以获取时刻截止并标为未收盘。null 不变成零价；高低价不能包围开收的记录只保留真实收盘，不修造 OHLC。
+现代日 OHLC 来自 [Yahoo Finance BTC-USD](https://finance.yahoo.com/quote/BTC-USD/)，匿名 JSON 请求 `query1.finance.yahoo.com/v8/finance/chart/BTC-USD`。UTC 标签代表日开始，完整收盘下一午夜才可用于历史估值；当日行情以获取时刻截止并标为未收盘。null 不变成零价，高低价不能包围开收时只保留真实收盘。
 
-早期和缺日参考价格来自 [Coin Metrics Community API](https://gitbook-docs.coinmetrics.io/packages/coin-metrics-community-data) 的每日 `PriceUSD`，乘以 [Frankfurter ECB 来源](https://frankfurter.dev/) 的同日历史 USD/CNY 参考汇率。非发布日采用此前最近汇率，超过七天则留空。参考记录用 `hasOHLC=false` 标识，只画灰线或灰点。
+最近七天 1 分钟优先 Yahoo BTC-USD，缺少或无效的完整蜡烛由 [Coinbase 历史蜡烛 API](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-candles) 补取真实 OHLC；主源失败则分页读取同一范围。其他盘中周期及较旧时间窗直接使用 Coinbase 原生 60 / 300 / 900 / 3600 / 21600 秒数据，按目标周期聚合。请求每页最多 300 个来源时段，去除边界重复，低于公开速率上限串行请求；不插值，不将日 K 拆成分钟 K。
 
-[PriceUSD 定义](https://github.com/coinmetrics/docs-website/blob/master/asset-metrics/market/priceusd.md) 与 [时间戳约定](https://github.com/coinmetrics/docs-website/blob/master/market-data/market-data-faqs.md) 将日价格标记在区间开始，值代表日终，因此可得时间移至下一 UTC 午夜。最早可靠日标签为 2010-07-18；全部视窗从创世日 2009-01-03 开始，此前没有价格的部分留空。每个有真实来源的日记录均保留，不抽样成四日线，也不补造行情。
+Coinbase 缺少历史交易的时段仍可能留空；单次视窗最多 16,000 根目标蜡烛、100,000 个来源时段，过大请求明确要求缩短日期范围或选择更长周期。较细周期可选择历史日期，但不能承诺所有交易所成立前的分钟数据。
 
-## 图表与历史状态
+早期及现代缺日参考收盘来自 [Coin Metrics Community API](https://gitbook-docs.coinmetrics.io/packages/coin-metrics-community-data) 的每日 `PriceUSD`，直接保留美元数值。它不提供 OHLC，使用 `hasOHLC=false` 画灰线 / 灰点。[PriceUSD 定义](https://github.com/coinmetrics/docs-website/blob/master/asset-metrics/market/priceusd.md) 把价格标记在 UTC 日开始，值代表日终，因此下一午夜才可用于历史估值。全部视窗从 2009-01-03 开始；可靠价格之前留空，每条有效日记录都保留。
 
-范围为 7 / 30 / 90 / 180 天、1 / 3 年及全部；周期为日 / 周 / 月。周从 UTC 周一开始，月按 UTC 自然月。有效 OHLC 按首开、最高、最低、末收聚合；含参考记录的周期画参考线，缺日或未收盘的周期不能标为完整。范围、周期、缩放、平移和重置只改变显示，展开图幅增加高度。
+市场行情无需汇率换算。购买人民币换算美元单独使用 [Frankfurter 的 ECB 来源](https://frankfurter.dev/) 每日 USD/CNY 参考值，换算与精度说明见 [Accounting.md](Accounting.md)。
 
-历史数字仅在查看图时显示在周期选择旁，横向排列并随窗口换行；点击图外收起，不影响图表。触控板双指横移平移时间，捏合按指针位置缩放；竖向滚动仍由总览处理。点击图取得焦点后，← / → 每次移动一天、一周或一个自然月，表单中的方向键保持原有行为。
+## 周期、范围与交互
 
-账本按所选截止时间重放，价格取该时间之前最近可得的行情并标明行情时间。盈亏使用该历史价格估算，不能借用未来收盘或后来购买 / 损耗；同日事件按截止时间汇总，成本线与标记仍逐事件变化。
+提供 1 / 3 / 5 / 15 / 30 分钟，1 / 2 / 4 / 6 / 8 / 12 小时，日、3 日、周、月、3 月和年。时间范围含常用范围与自选起止日期。固定周期按 UTC 锚点聚合；周从周一开始，月 / 季度 / 年使用自然日期边界。OHLC 按首开、最高、最低、末收聚合；有缺口、参考记录或尚未收盘的周期不能标为完整。
+
+历史数字排列在范围 / 周期选择旁，查看图时显示，点击图外收起。截止时刻按原始时间计算，界面显示到分钟，账本仅累计此前已发生事件；价格使用当时之前最近可得的收盘，注明行情时间。历史盈亏不借用未来行情或后来的购买 / 损耗。购买和转移仍逐事件改变成本线。
+
+双指横移平移，图内捏合围绕指针缩放时间；右侧价格轴独立上下拖动缩放，双击恢复可见行情适配；点击图取得焦点后 ← / → 每次移动一根当前周期，表单不受影响。平移不自动改变纵轴比例，即使扩展到新的历史来源窗口；明确时间缩放在自动价轴模式下适配可见行情；手动价轴后只改变时间。重置 / 范围 / 周期切换恢复默认视图。横轴刻度按窗口时长与 UTC 锚点生成，平移不改变间距。正常窗口一屏显示；展开图幅增加高度，极小窗口保留可读内容并允许滚动。
 
 ## 缓存与失败处理
 
-完整日历史缓存在账本旁 `market-history-daily-v1.json`，四小时有效。手动刷新至少间隔一分钟，HTTP 429 退避；没有定时轮询，范围、周期和缩放不触发请求。
+全新美元日、分钟和其他盘中周期缓存与旧人民币缓存隔离。日缓存四小时有效，最近分钟一分钟有效；尚未覆盖的盘中时间窗在平移 / 缩放停止后加载，已有覆盖直接读缓存。旧异步请求被取消后不发布数据或错误，历史数字不触发请求。手动刷新至少间隔一分钟，HTTP 429 退避。
 
-现代日 K 失败时保留最后成功缓存及时间；早期参考源失败仍显示现代日 K 和提示，并保留已有早期缓存。无可用行情时显示错误，不用今天价格回填历史。
+来源失败时保留最后成功缓存及获取时间；早期参考源失败仍可显示现代日行情。无可用数据时显示错误，不用今天价格回填。匿名服务可能修正或缺失数据，参考收盘与真实 OHLC 始终区分。
 
-无需 Key、账户或订阅。匿名服务没有稳定性保证，数据可能修正或缺失；参考线与真实 OHLC 始终分开。请求只含固定币种和公共历史日期，不发送账户、金额或持仓。
+无需 API Key、账户或订阅。请求只含固定币种和公共历史日期，不发送账本金额、账户或持仓。

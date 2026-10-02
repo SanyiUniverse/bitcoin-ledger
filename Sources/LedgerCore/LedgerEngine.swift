@@ -72,10 +72,25 @@ public enum LedgerEngine {
                       entry.amountCNY > 0 else {
                     throw LedgerError.invalid("购买需选择存入账户，并填写实际投入人民币和实际获得 BTC。")
                 }
+                if let conversion = entry.conversion {
+                    let rate = conversion.rate
+                    var calendar = Calendar(identifier: .gregorian)
+                    calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+                    guard rate.date.timeIntervalSinceReferenceDate.isFinite,
+                          calendar.startOfDay(for: rate.date) == rate.date,
+                          rate.availableAt <= entry.date, entry.date.timeIntervalSince(rate.date) <= 7 * 86_400,
+                          !rate.cnyPerUSD.isNaN, rate.cnyPerUSD > 0, rate.cnyPerUSD < 1000,
+                          Amounts.rounded(rate.cnyPerUSD) == rate.cnyPerUSD,
+                          !rate.source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, rate.source.count <= 200,
+                          !conversion.amountUSD.isNaN, conversion.amountUSD > 0, conversion.amountUSD <= Amounts.maximumCNY,
+                          conversion.amountUSD == Amounts.rounded(entry.amountCNY / rate.cnyPerUSD) else {
+                        throw LedgerError.invalid("美元投入与已公布的历史汇率不一致；请重新换算该购买记录。")
+                    }
+                }
             case .transfer:
                 guard entry.fromAccountID != nil, entry.toAccountID != nil,
                       entry.fromAccountID != entry.toAccountID, entry.amountSats > 0,
-                      entry.receivedSats <= entry.amountSats, entry.amountCNY == 0 else {
+                      entry.receivedSats <= entry.amountSats, entry.amountCNY == 0, entry.conversion == nil else {
                     throw LedgerError.invalid("转移需选择不同账户，转出 BTC 大于 0，到账不能超过转出数量。")
                 }
             }
@@ -85,7 +100,9 @@ public enum LedgerEngine {
     private static func apply(_ entry: LedgerEntry, to result: inout LedgerSnapshot) throws {
         switch entry.kind {
         case .buy:
-            result.totalInvestedCNY = try adding(result.totalInvestedCNY, entry.amountCNY)
+            if let total = result.totalInvestedUSD, let dollars = entry.amountUSD {
+                result.totalInvestedUSD = try adding(total, dollars)
+            } else { result.totalInvestedUSD = nil }
             result.totalPurchasedSats = try adding(result.totalPurchasedSats, entry.receivedSats)
             try credit(entry.receivedSats, account: entry.toAccountID!, to: &result)
         case .transfer:
@@ -100,7 +117,7 @@ public enum LedgerEngine {
         result.totalSats = result.totalPurchasedSats - result.totalLossSats
         let accountTotal = try result.balances.values.reduce(Int64(0)) { try adding($0, $1) }
         guard result.totalSats >= 0, result.totalSats <= Amounts.maximumSats,
-              result.totalInvestedCNY <= Amounts.maximumCNY,
+              result.totalInvestedUSD == nil || result.totalInvestedUSD! <= Amounts.maximumCNY,
               accountTotal == result.totalSats else {
             throw LedgerError.invalid("账户余额、BTC 总量或累计投入超出支持范围。")
         }

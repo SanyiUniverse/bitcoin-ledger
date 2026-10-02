@@ -182,7 +182,7 @@ func unsupportedPolicyIsNeverSilentlyMigrated() throws {
 }
 
 @Test @MainActor
-func firstV2SavePreservesOriginalBytesBeforeUpgradingToV3() throws {
+func firstV2SavePreservesOriginalBytesBeforeUpgradingToV4() throws {
     let url = temporaryLedgerURL()
     let directory = url.deletingLastPathComponent()
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -191,10 +191,10 @@ func firstV2SavePreservesOriginalBytesBeforeUpgradingToV3() throws {
     try original.write(to: url)
     let repository = try LedgerRepository(url: url)
     let migrated = try repository.load()
-    #expect(migrated.schemaVersion == 3)
+    #expect(migrated.schemaVersion == 4)
     #expect(try Data(contentsOf: url) == original)
     try repository.save(migrated)
-    #expect(try BackupCodec.schemaVersion(in: Data(contentsOf: url)) == 3)
+    #expect(try BackupCodec.schemaVersion(in: Data(contentsOf: url)) == 4)
     let preserved = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         .filter { $0.lastPathComponent.hasPrefix("ledger.before-upgrade-v2-") }
     #expect(preserved.count == 1)

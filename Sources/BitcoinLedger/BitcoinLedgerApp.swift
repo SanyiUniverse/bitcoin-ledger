@@ -27,7 +27,7 @@ struct BitcoinLedgerApp: App {
         .commands {
             CommandGroup(after: .newItem) {
                 Button("导出完整备份…") { store.exportJSON() }.keyboardShortcut("e", modifiers: [.command, .shift]).disabled(!store.canEdit || store.isPresentingPanel)
-                Button("导出交易历史 CSV…") { store.exportCSV() }.disabled(!store.canEdit || store.isPresentingPanel)
+                Button("导出历史记录 CSV…") { store.exportCSV() }.disabled(!store.canEdit || store.isPresentingPanel)
                 Button("从 JSON 备份恢复…") { store.importJSON() }.disabled(store.isPresentingPanel)
             }
         }

@@ -23,6 +23,8 @@ public enum RepositoryError: LocalizedError {
 public final class LedgerRepository {
     public let url: URL?
     public var previousURL: URL? { url?.deletingLastPathComponent().appendingPathComponent("ledger.previous.json") }
+    public private(set) var needsMigration = false
+    public private(set) var lastMigrationBackupURL: URL?
     private var memoryDocument = BackupDocument()
     private var lastReadData: Data?
     private var hasLoaded = false
@@ -51,6 +53,7 @@ public final class LedgerRepository {
         hasLoaded = true
         do {
             memoryDocument = try raw.map { try BackupCodec.decode($0) } ?? BackupDocument()
+            needsMigration = try raw.map { try BackupCodec.schemaVersion(in: $0) < BackupDocument.currentSchemaVersion } ?? false
         } catch {
             throw RepositoryError.unreadableStore(error.localizedDescription)
         }
@@ -65,7 +68,7 @@ public final class LedgerRepository {
         let data = try BackupCodec.encode(document)
         // Validate the precise serialized representation before touching disk.
         let validated = try BackupCodec.decode(data)
-        guard let url else { memoryDocument = validated; return }
+        guard let url else { memoryDocument = validated; needsMigration = false; return }
         let manager = FileManager.default
         let directory = url.deletingLastPathComponent()
         try manager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -90,6 +93,7 @@ public final class LedgerRepository {
                 if originalVersion < BackupDocument.currentSchemaVersion {
                     let preserved = directory.appendingPathComponent("ledger.before-upgrade-v\(originalVersion)-\(UUID().uuidString).json")
                     try writePrivate(current, to: preserved)
+                    lastMigrationBackupURL = preserved
                 }
                 if preserveCurrent {
                     let preserved = directory.appendingPathComponent("ledger.before-import-\(UUID().uuidString).json")
@@ -103,6 +107,7 @@ public final class LedgerRepository {
         memoryDocument = validated
         lastReadData = data
         hasLoaded = true
+        needsMigration = false
     }
 
     private func writePrivate(_ data: Data, to url: URL) throws {

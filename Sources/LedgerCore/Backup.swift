@@ -1,8 +1,31 @@
 import Foundation
 
+public struct MigrationIssue: Identifiable, Codable, Equatable, Sendable {
+    public var id: UUID
+    public var date: Date
+    public var kind: String
+    public var reason: String
+}
+
+/// Metadata proves which original records supplied each retained BTC event.
+/// No old settlement balances or fee accounting remain in the new ledger.
+public struct MigrationMapping: Codable, Equatable, Sendable {
+    public var targetEntryID: UUID
+    public var sourceEntryIDs: [UUID]
+    public var sourceDates: [Date]
+}
+
+public struct MigrationReport: Codable, Equatable, Sendable {
+    public var sourceSchemaVersion: Int
+    public var sourceEntryCount: Int
+    public var migratedCount: Int
+    public var mappings: [MigrationMapping]
+    public var issues: [MigrationIssue]
+}
+
 public struct BackupDocument: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 3
-    public static let supportedAccountingPolicy = "cny-principal-moving-average-v1"
+    public static let currentSchemaVersion = 4
+    public static let supportedAccountingPolicy = "cny-invested-net-btc-v1"
     public var schemaVersion: Int
     public var baseCurrency: String
     public var accountingPolicy: String
@@ -10,9 +33,13 @@ public struct BackupDocument: Codable, Equatable, Sendable {
     public var accounts: [Account]
     public var entries: [LedgerEntry]
     public var lastPrice: PriceQuote?
+    public var migrationReport: MigrationReport?
 
-    public init(schemaVersion: Int = BackupDocument.currentSchemaVersion, exportedAt: Date = Date(), accounts: [Account] = [], entries: [LedgerEntry] = [], lastPrice: PriceQuote? = nil,
-                baseCurrency: String = "CNY", accountingPolicy: String = BackupDocument.supportedAccountingPolicy) {
+    public init(schemaVersion: Int = Self.currentSchemaVersion, exportedAt: Date = Date(),
+                accounts: [Account] = Account.defaults, entries: [LedgerEntry] = [],
+                lastPrice: PriceQuote? = nil, baseCurrency: String = "CNY",
+                accountingPolicy: String = Self.supportedAccountingPolicy,
+                migrationReport: MigrationReport? = nil) {
         self.schemaVersion = schemaVersion
         self.baseCurrency = baseCurrency
         self.accountingPolicy = accountingPolicy
@@ -20,84 +47,7 @@ public struct BackupDocument: Codable, Equatable, Sendable {
         self.accounts = accounts
         self.entries = entries
         self.lastPrice = lastPrice
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case schemaVersion, baseCurrency, accountingPolicy, exportedAt, accounts, entries, lastPrice, entryValuations
-    }
-
-    private struct RequiredV2EntryFields: Decodable {
-        let settlementCurrency: SettlementCurrency
-        let amountUSDT: String
-        let receivedUSDT: String
-        let feeUSDT: String
-        let feeValuationSource: FeeValuationSource
-    }
-
-    public init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        let originalVersion = try values.decode(Int.self, forKey: .schemaVersion)
-        guard (1...Self.currentSchemaVersion).contains(originalVersion) else {
-            throw BackupError.unsupportedSchema(originalVersion)
-        }
-        if originalVersion == 1 {
-            baseCurrency = try values.decodeIfPresent(String.self, forKey: .baseCurrency) ?? "CNY"
-            accountingPolicy = try values.decodeIfPresent(String.self, forKey: .accountingPolicy) ?? Self.supportedAccountingPolicy
-        } else {
-            baseCurrency = try values.decode(String.self, forKey: .baseCurrency)
-            accountingPolicy = try values.decode(String.self, forKey: .accountingPolicy)
-        }
-        try BackupCodec.validatePolicy(baseCurrency: baseCurrency, accountingPolicy: accountingPolicy)
-        schemaVersion = Self.currentSchemaVersion
-        exportedAt = try values.decode(Date.self, forKey: .exportedAt)
-        accounts = try values.decode([Account].self, forKey: .accounts)
-        if originalVersion >= 2 {
-            // Entry decoding has legacy defaults for v1 only. A v2 document
-            // must explicitly state its settlement/fee semantics, even at zero.
-            _ = try values.decode([RequiredV2EntryFields].self, forKey: .entries)
-        }
-        entries = try values.decode([LedgerEntry].self, forKey: .entries)
-        lastPrice = try values.decodeIfPresent(PriceQuote.self, forKey: .lastPrice)
-        if originalVersion == 1 {
-            // Version 1 could only represent BTC and CNY. A misleading version
-            // marker must not smuggle USDT activity or a different fee policy in.
-            guard entries.allSatisfy({
-                [EntryKind.buy, .transfer, .sell, .fee].contains($0.kind)
-                    && $0.settlementCurrency == .cny && $0.amountUSDT == 0
-                    && $0.receivedUSDT == 0 && $0.feeUSDT == 0
-                    && $0.feeCurrency != .usdt && $0.feeValuationSource == .manualPrice
-            }) else { throw BackupError.invalidDocument("版本 1 不能包含 USDT 或新的费用估值口径。") }
-        }
-        if originalVersion == 2, entries.contains(where: { $0.kind == .adjustUSDT }) {
-            throw BackupError.invalidDocument("版本 2 不能包含 USDT 余额校正记录。")
-        }
-        let replay = try BackupCodec.validatedSnapshot(self)
-        if originalVersion >= 2 {
-            let stored = try values.decode([String: EntryValuation].self, forKey: .entryValuations)
-            var parsed: [UUID: EntryValuation] = [:]
-            for (key, value) in stored {
-                guard let id = UUID(uuidString: key), parsed.updateValue(value, forKey: id) == nil else {
-                    throw BackupError.invalidDocument("逐笔成本快照 ID 无效或重复。")
-                }
-            }
-            guard parsed == replay.entryValuations else {
-                throw BackupError.invalidDocument("逐笔人民币成本或费用快照与原始记录不一致。")
-            }
-        }
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        let replay = try BackupCodec.validatedSnapshot(self)
-        var values = encoder.container(keyedBy: CodingKeys.self)
-        try values.encode(schemaVersion, forKey: .schemaVersion)
-        try values.encode(baseCurrency, forKey: .baseCurrency)
-        try values.encode(accountingPolicy, forKey: .accountingPolicy)
-        try values.encode(exportedAt, forKey: .exportedAt)
-        try values.encode(accounts, forKey: .accounts)
-        try values.encode(entries, forKey: .entries)
-        try values.encodeIfPresent(lastPrice, forKey: .lastPrice)
-        let valuations = Dictionary(uniqueKeysWithValues: replay.entryValuations.map { ($0.key.uuidString, $0.value) })
-        try values.encode(valuations, forKey: .entryValuations)
+        self.migrationReport = migrationReport
     }
 }
 
@@ -119,7 +69,7 @@ public enum BackupError: LocalizedError, Equatable {
 
 public enum BackupCodec {
     public static let maximumBytes = 20 * 1_024 * 1_024
-
+    private static let legacyPolicy = "cny-principal-moving-average-v1"
     private struct Header: Decodable {
         let schemaVersion: Int
         let baseCurrency: String?
@@ -127,8 +77,6 @@ public enum BackupCodec {
     }
     private struct VersionHeader: Decodable { let schemaVersion: Int }
 
-    /// Reads only the version/policy header before attempting a version-specific
-    /// document decode, so future schemas fail clearly even with unknown bodies.
     public static func schemaVersion(in data: Data) throws -> Int {
         guard data.count <= maximumBytes else { throw BackupError.tooLarge }
         let version: Int
@@ -140,28 +88,24 @@ public enum BackupCodec {
         let header: Header
         do { header = try JSONDecoder().decode(Header.self, from: data) }
         catch { throw BackupError.invalidDocument("JSON 备份头信息不正确。") }
-        if header.schemaVersion >= 2 {
-            guard let base = header.baseCurrency, let policy = header.accountingPolicy else {
-                throw BackupError.invalidDocument("版本 \(header.schemaVersion) 缺少本位币或记账口径。")
-            }
-            try validatePolicy(baseCurrency: base, accountingPolicy: policy)
-        } else {
-            try validatePolicy(baseCurrency: header.baseCurrency ?? "CNY", accountingPolicy: header.accountingPolicy ?? BackupDocument.supportedAccountingPolicy)
+        guard (1...BackupDocument.currentSchemaVersion).contains(header.schemaVersion) else {
+            throw BackupError.unsupportedSchema(header.schemaVersion)
+        }
+        guard header.schemaVersion == 1 || (header.baseCurrency != nil && header.accountingPolicy != nil) else {
+            throw BackupError.invalidDocument("备份缺少本位币或记账口径。")
+        }
+        guard header.baseCurrency ?? "CNY" == "CNY" else { throw BackupError.invalidDocument("本位币必须为 CNY。") }
+        let supportedPolicy = header.schemaVersion < 4 ? legacyPolicy : BackupDocument.supportedAccountingPolicy
+        guard header.accountingPolicy ?? supportedPolicy == supportedPolicy else {
+            throw BackupError.unsupportedAccountingPolicy(header.accountingPolicy ?? "")
         }
         return header.schemaVersion
     }
 
-    fileprivate static func validatePolicy(baseCurrency: String, accountingPolicy: String) throws {
-        guard baseCurrency == "CNY" else { throw BackupError.invalidDocument("本位币必须为 CNY。") }
-        guard accountingPolicy == BackupDocument.supportedAccountingPolicy else {
-            throw BackupError.unsupportedAccountingPolicy(accountingPolicy)
-        }
-    }
-
     public static func encode(_ document: BackupDocument) throws -> Data {
+        try validate(document)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        // Foundation retains fractional milliseconds; money remains Decimal strings.
         encoder.dateEncodingStrategy = .millisecondsSince1970
         let data = try encoder.encode(document)
         guard data.count <= maximumBytes else { throw BackupError.tooLarge }
@@ -173,88 +117,71 @@ public enum BackupCodec {
     }
 
     public static func decode(_ data: Data) throws -> BackupDocument {
-        _ = try schemaVersion(in: data)
+        let version = try schemaVersion(in: data)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .millisecondsSince1970
-        let document: BackupDocument
-        do { document = try decoder.decode(BackupDocument.self, from: data) }
-        catch let error as BackupError { throw error }
+        do {
+            let document = version == 4
+                ? try decoder.decode(BackupDocument.self, from: data)
+                : try migrate(decoder.decode(LegacyDocument.self, from: data))
+            try validate(document)
+            return document
+        } catch let error as BackupError { throw error }
         catch { throw BackupError.invalidDocument("JSON 格式、日期或数值格式不正确。\(error.localizedDescription)") }
-        return document
     }
 
     public static func validate(_ document: BackupDocument) throws {
-        _ = try validatedSnapshot(document)
-    }
-
-    fileprivate static func validatedSnapshot(_ document: BackupDocument) throws -> LedgerSnapshot {
-        guard document.schemaVersion == BackupDocument.currentSchemaVersion else { throw BackupError.unsupportedSchema(document.schemaVersion) }
-        try validatePolicy(baseCurrency: document.baseCurrency, accountingPolicy: document.accountingPolicy)
+        guard document.schemaVersion == BackupDocument.currentSchemaVersion else {
+            throw BackupError.unsupportedSchema(document.schemaVersion)
+        }
+        guard document.baseCurrency == "CNY" else { throw BackupError.invalidDocument("本位币必须为 CNY。") }
+        guard document.accountingPolicy == BackupDocument.supportedAccountingPolicy else {
+            throw BackupError.unsupportedAccountingPolicy(document.accountingPolicy)
+        }
         guard document.exportedAt.timeIntervalSinceReferenceDate.isFinite else {
             throw BackupError.invalidDocument("导出日期无效。")
         }
         if let quote = document.lastPrice {
-            guard quote.priceCNY > 0, quote.priceCNY <= Decimal(1_000_000_000_000),
+            guard quote.priceCNY > 0, quote.priceCNY <= Amounts.maximumPrice,
                   quote.fetchedAt.timeIntervalSinceReferenceDate.isFinite,
                   !quote.source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  quote.source.count <= 200 else {
-                throw BackupError.invalidDocument("缓存行情无效。")
+                  quote.source.count <= 200 else { throw BackupError.invalidDocument("缓存行情无效。") }
+        }
+        if let report = document.migrationReport {
+            guard (1...3).contains(report.sourceSchemaVersion), report.sourceEntryCount >= 0,
+                  report.migratedCount >= 0, report.migratedCount <= report.sourceEntryCount,
+                  report.mappings.allSatisfy({ !$0.sourceEntryIDs.isEmpty && $0.sourceEntryIDs.count == $0.sourceDates.count
+                      && $0.sourceDates.allSatisfy { $0.timeIntervalSinceReferenceDate.isFinite } }),
+                  report.issues.allSatisfy({ $0.date.timeIntervalSinceReferenceDate.isFinite && !$0.reason.isEmpty }) else {
+                throw BackupError.invalidDocument("迁移报告无效。")
             }
         }
-        // The same complete replay validation used for all edits also applies to imports.
-        return try LedgerEngine.calculate(accounts: document.accounts, entries: document.entries)
+        _ = try LedgerEngine.calculate(accounts: document.accounts, entries: document.entries)
     }
 
-    /// RFC 4180 CSV with UTF-8 BOM for Excel/WPS. Numeric values are exact base-10
-    /// strings; free text is prefixed with an apostrophe when it could be a formula.
     public static func csv(_ document: BackupDocument) throws -> Data {
         try validate(document)
         return try csv(accounts: document.accounts, entries: document.entries)
     }
 
     public static func csv(accounts: [Account], entries: [LedgerEntry]) throws -> Data {
-        let replay = try LedgerEngine.calculate(accounts: accounts, entries: entries)
-        let accountMap = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0) })
-        var rows = [["id", "date_utc", "sequence", "kind", "from_account_id", "from_account_name", "from_account_type", "to_account_id", "to_account_name", "to_account_type", "amount_sats", "amount_btc", "received_sats", "received_btc", "amount_cny", "fee_currency", "fee_sats", "fee_btc", "fee_cny", "fee_price_cny_per_btc", "fee_cny_equivalent", "fee_category", "note", "settlement_currency", "amount_usdt", "received_usdt", "fee_usdt", "fee_valuation_source", "entry_cost_cny", "fee_unit_cost_cny", "base_currency", "accounting_policy", "adjustment_before_usdt", "adjustment_after_usdt", "adjustment_delta_usdt"]]
-        for entry in entries.sorted(by: {
-            if $0.date != $1.date { return $0.date < $1.date }
-            if $0.sequence != $1.sequence { return $0.sequence < $1.sequence }
-            return $0.id.uuidString < $1.id.uuidString
-        }) {
-            let from = entry.fromAccountID.flatMap { accountMap[$0] }
-            let to = entry.toAccountID.flatMap { accountMap[$0] }
-            guard let valuation = replay.entryValuations[entry.id] else {
-                throw BackupError.invalidDocument("缺少逐笔人民币成本快照。")
-            }
-            let feeEquivalent = valuation.feeCNYEquivalent
-            var adjustmentColumns = ["", "", ""]
-            if entry.kind == .adjustUSDT {
-                guard let before = valuation.beforeUSDT, let after = valuation.afterUSDT else {
-                    throw BackupError.invalidDocument("余额校正记录缺少重放前后数量。")
-                }
-                adjustmentColumns = [decimalString(before), decimalString(after), decimalString(after - before)]
-            }
+        _ = try LedgerEngine.calculate(accounts: accounts, entries: entries)
+        let names = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0.name) })
+        var rows = [["id", "date_utc", "sequence", "kind", "from_account_id", "from_account_name",
+                     "to_account_id", "to_account_name", "amount_sats", "amount_btc", "received_sats",
+                     "received_btc", "amount_cny", "loss_sats", "loss_btc", "note"]]
+        for entry in LedgerEngine.ordered(entries) {
             rows.append([
                 entry.id.uuidString, timestamp(entry.date), String(entry.sequence), entry.kind.rawValue,
-                entry.fromAccountID?.uuidString ?? "", safeText(from?.name ?? ""), from?.kind.rawValue ?? "",
-                entry.toAccountID?.uuidString ?? "", safeText(to?.name ?? ""), to?.kind.rawValue ?? "",
-                String(entry.amountSats), decimalString(Decimal(entry.amountSats) / Decimal(100_000_000)),
-                String(entry.receivedSats), decimalString(Decimal(entry.receivedSats) / Decimal(100_000_000)),
-                decimalString(entry.amountCNY), entry.feeCurrency.rawValue,
-                String(entry.feeSats), decimalString(Decimal(entry.feeSats) / Decimal(100_000_000)),
-                decimalString(entry.feeCNY), decimalString(entry.feePriceCNY), decimalString(feeEquivalent),
-                entry.feeCategory.rawValue, safeText(entry.note), entry.settlementCurrency.rawValue,
-                decimalString(entry.amountUSDT), decimalString(entry.receivedUSDT), decimalString(entry.feeUSDT),
-                entry.feeValuationSource.rawValue, decimalString(valuation.costCNY), decimalString(valuation.feeUnitCostCNY),
-                "CNY", BackupDocument.supportedAccountingPolicy
-            ] + adjustmentColumns)
+                entry.fromAccountID?.uuidString ?? "", safeText(entry.fromAccountID.flatMap { names[$0] } ?? ""),
+                entry.toAccountID?.uuidString ?? "", safeText(entry.toAccountID.flatMap { names[$0] } ?? ""),
+                String(entry.amountSats), Amounts.string(Amounts.btc(entry.amountSats)),
+                String(entry.receivedSats), Amounts.string(Amounts.btc(entry.receivedSats)),
+                Amounts.string(entry.amountCNY), String(entry.lossSats), Amounts.string(Amounts.btc(entry.lossSats)), safeText(entry.note)
+            ])
         }
         let csv = "\u{FEFF}" + rows.map { $0.map(escapeCSV).joined(separator: ",") }.joined(separator: "\r\n") + "\r\n"
         return Data(csv.utf8)
-    }
-
-    private static func decimalString(_ value: Decimal) -> String {
-        NSDecimalNumber(decimal: value).stringValue
     }
 
     private static func timestamp(_ date: Date) -> String {
@@ -263,18 +190,216 @@ public enum BackupCodec {
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.string(from: date)
     }
-
     private static func safeText(_ value: String) -> String {
         let first = value.trimmingCharacters(in: .whitespacesAndNewlines).first
         let formulaStart = first.map { "=+-@".contains($0) } ?? false
         let controlStart = value.first.map { $0 == "\t" || $0 == "\r" || $0 == "\n" } ?? false
         return formulaStart || controlStart ? "'" + value : value
     }
-
     private static func escapeCSV(_ value: String) -> String {
         if value.contains(",") || value.contains("\"") || value.contains("\r") || value.contains("\n") {
             return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
         }
         return value
+    }
+}
+
+// Everything below is read-only migration input. Old fields are never encoded
+// into v4 events or used by the runtime ledger calculations.
+private struct LegacyAccount: Decodable {
+    var id: UUID
+    var name: String
+    var kind: String?
+    var isArchived: Bool?
+}
+private struct LegacyDocument: Decodable {
+    var schemaVersion: Int
+    var exportedAt: Date
+    var accounts: [LegacyAccount]
+    var entries: [LegacyEntry]
+    var lastPrice: PriceQuote?
+}
+private struct LegacyEntry: Decodable {
+    var id: UUID
+    var date: Date
+    var sequence: Int64
+    var kind: String
+    var fromAccountID: UUID?
+    var toAccountID: UUID?
+    var amountSats: Int64
+    var receivedSats: Int64
+    var amountCNY: String
+    var feeCurrency: String
+    var feeSats: Int64
+    var feeCNY: String
+    var note: String
+    var settlementCurrency: String?
+    var amountUSDT: String?
+    var receivedUSDT: String?
+    var feeUSDT: String?
+    var feeValuationSource: String?
+}
+
+private extension BackupCodec {
+    static func migrate(_ old: LegacyDocument) throws -> BackupDocument {
+        if old.schemaVersion >= 2 {
+            guard old.entries.allSatisfy({ $0.settlementCurrency != nil && $0.amountUSDT != nil
+                && $0.receivedUSDT != nil && $0.feeUSDT != nil && $0.feeValuationSource != nil }) else {
+                throw BackupError.invalidDocument("旧版记录缺少明确的结算或费用字段，未猜测其含义。")
+            }
+        }
+        guard Set(old.entries.map(\.id)).count == old.entries.count else {
+            throw BackupError.invalidDocument("旧记录 ID 重复，不能可靠迁移。")
+        }
+        var accounts = old.accounts.map { Account(id: $0.id, name: $0.name) }
+        let activeExchanges = old.accounts.filter { $0.kind == "exchange" && $0.isArchived != true }
+        if activeExchanges.count == 1, let known = activeExchanges.first,
+           known.name.lowercased().contains("okx") || known.name.contains("欧易"),
+           let index = accounts.firstIndex(where: { $0.id == known.id }) { accounts[index].name = "欧易" }
+        let activeWallets = old.accounts.filter { $0.kind == "selfCustody" && $0.isArchived != true }
+        if activeWallets.count == 1, let known = activeWallets.first,
+           let index = accounts.firstIndex(where: { $0.id == known.id }) { accounts[index].name = "自有钱包" }
+        for account in Account.defaults where !accounts.contains(where: { $0.name == account.name }) {
+            if !accounts.contains(where: { $0.id == account.id }) { accounts.append(account) }
+        }
+        _ = try LedgerEngine.calculate(accounts: accounts, entries: [])
+
+        let ordered = old.entries.sorted {
+            if $0.date != $1.date { return $0.date < $1.date }
+            if $0.sequence != $1.sequence { return $0.sequence < $1.sequence }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+        let lastIntermediateIndex = ordered.lastIndex(where: {
+            ["buyUSDT", "sellUSDT", "adjustUSDT"].contains($0.kind)
+                || $0.settlementCurrency == "usdt" || $0.feeCurrency == "usdt"
+        })
+        var candidates: [LedgerEntry] = []
+        var mappings: [MigrationMapping] = []
+        var issues: [MigrationIssue] = []
+        var consumedIDs = Set<UUID>()
+        var intermediateBalanceKnownZero = true
+
+        func issue(_ entry: LegacyEntry, _ reason: String) {
+            issues.append(MigrationIssue(id: entry.id, date: entry.date, kind: entry.kind, reason: reason))
+        }
+        for (index, entry) in ordered.enumerated() where !consumedIDs.contains(entry.id) {
+            do {
+                try validateLegacy(entry)
+                guard entry.date.timeIntervalSinceReferenceDate.isFinite, entry.sequence >= 0,
+                      entry.sequence < Int64.max, entry.note.count <= 10_000 else {
+                    throw LedgerError.invalid("旧记录日期、顺序或备注无效。")
+                }
+                let cny = try Amounts.decimal(entry.amountCNY)
+                let feeCNY = try Amounts.decimal(entry.feeCNY)
+                let settlement = entry.settlementCurrency ?? "cny"
+                if entry.kind == "buy", settlement == "cny" {
+                    guard cny > 0, entry.receivedSats == 0, entry.amountSats > 0,
+                          ["cny", "btc"].contains(entry.feeCurrency), entry.feeSats >= 0,
+                          (entry.feeCurrency != "btc" || feeCNY == 0),
+                          (try Amounts.decimal(entry.amountUSDT ?? "0", maxPlaces: 8)) == 0 else {
+                        throw LedgerError.invalid("人民币购买记录的原字段关系不明确。")
+                    }
+                    // Legacy amountSats already represented NET BTC received.
+                    candidates.append(LedgerEntry(id: entry.id, date: entry.date, sequence: entry.sequence,
+                        kind: .buy, toAccountID: entry.toAccountID, receivedSats: entry.amountSats,
+                        amountCNY: cny + feeCNY, note: entry.note))
+                    mappings.append(MigrationMapping(targetEntryID: entry.id, sourceEntryIDs: [entry.id], sourceDates: [entry.date]))
+                } else if entry.kind == "transfer" {
+                    guard entry.amountSats > 0, entry.receivedSats >= 0,
+                          entry.receivedSats <= entry.amountSats,
+                          entry.amountSats - entry.receivedSats == entry.feeSats,
+                          cny == 0, feeCNY == 0, settlement == "cny", entry.feeCurrency != "usdt" else {
+                        throw LedgerError.invalid("转移的到账、损耗或外付人民币不能可靠映射，请确认原记录。")
+                    }
+                    candidates.append(LedgerEntry(id: entry.id, date: entry.date, sequence: entry.sequence,
+                        kind: .transfer, fromAccountID: entry.fromAccountID, toAccountID: entry.toAccountID,
+                        amountSats: entry.amountSats, receivedSats: entry.receivedSats, note: entry.note))
+                    mappings.append(MigrationMapping(targetEntryID: entry.id, sourceEntryIDs: [entry.id], sourceDates: [entry.date]))
+                } else if entry.kind == "buyUSDT", intermediateBalanceKnownZero,
+                          index + 1 < ordered.count {
+                    let purchase = ordered[index + 1]
+                    try validateLegacy(purchase)
+                    let funded = try Amounts.decimal(entry.receivedUSDT ?? "0", maxPlaces: 8)
+                    let debited = try Amounts.decimal(purchase.amountUSDT ?? "0", maxPlaces: 8)
+                    let purchaseCNY = try Amounts.decimal(purchase.amountCNY)
+                    let purchaseFeeCNY = try Amounts.decimal(purchase.feeCNY)
+                    guard purchase.kind == "buy", purchase.settlementCurrency == "usdt",
+                          cny > 0, funded > 0, debited > 0, debited <= funded,
+                          purchaseCNY == 0, purchase.amountSats > 0, purchase.receivedSats == 0,
+                          purchase.fromAccountID == nil, purchase.toAccountID != nil,
+                          entry.fromAccountID == nil, entry.toAccountID == nil,
+                          entry.amountSats == 0, entry.receivedSats == 0,
+                          entry.feeCurrency != "btc", feeCNY <= cny,
+                          purchase.feeSats >= 0,
+                          ["cny", "btc", "usdt"].contains(purchase.feeCurrency),
+                          (purchase.feeCurrency != "btc" || purchaseFeeCNY == 0),
+                          (purchase.feeCurrency != "usdt" || purchaseFeeCNY == 0),
+                          (try Amounts.decimal(purchase.feeUSDT ?? "0", maxPlaces: 8)) < debited,
+                          (funded == debited || lastIntermediateIndex == index + 1) else {
+                        intermediateBalanceKnownZero = false
+                        throw LedgerError.invalid("无法确定一笔人民币投入唯一对应哪笔 BTC 购买；未采用平均汇率推算。")
+                    }
+                    // The exact, isolated funding belongs entirely to this BTC
+                    // purchase. Only the final chain may leave an unused balance,
+                    // which the requested model explicitly treats as its cost.
+                    candidates.append(LedgerEntry(id: purchase.id, date: purchase.date, sequence: purchase.sequence,
+                        kind: .buy, toAccountID: purchase.toAccountID, receivedSats: purchase.amountSats,
+                        amountCNY: cny + purchaseFeeCNY, note: purchase.note))
+                    mappings.append(MigrationMapping(targetEntryID: purchase.id,
+                        sourceEntryIDs: [entry.id, purchase.id], sourceDates: [entry.date, purchase.date]))
+                    consumedIDs.insert(purchase.id)
+                    intermediateBalanceKnownZero = funded == debited
+                } else {
+                    if ["buyUSDT", "sellUSDT", "adjustUSDT"].contains(entry.kind)
+                        || settlement == "usdt" || entry.feeCurrency == "usdt" {
+                        intermediateBalanceKnownZero = false
+                    }
+                    issue(entry, "此旧记录不能唯一转换为购买或转移；完整原数据已保留，需人工确认。")
+                }
+            } catch {
+                if entry.kind == "buyUSDT" || entry.settlementCurrency == "usdt" { intermediateBalanceKnownZero = false }
+                issue(entry, error.localizedDescription)
+            }
+        }
+        // Most ledgers validate in one linear replay. If skipped old purchases
+        // caused a missing transfer balance, isolate those dependent events.
+        var entries = candidates
+        if (try? LedgerEngine.calculate(accounts: accounts, entries: entries)) == nil {
+            entries = []
+            for candidate in LedgerEngine.ordered(candidates) {
+                do {
+                    _ = try LedgerEngine.calculate(accounts: accounts, entries: entries + [candidate])
+                    entries.append(candidate)
+                } catch {
+                    let sourceIDs = mappings.first(where: { $0.targetEntryID == candidate.id })?.sourceEntryIDs ?? [candidate.id]
+                    for original in ordered where sourceIDs.contains(original.id) { issue(original, error.localizedDescription) }
+                    mappings.removeAll { $0.targetEntryID == candidate.id }
+                }
+            }
+        }
+        return BackupDocument(exportedAt: old.exportedAt, accounts: accounts, entries: entries,
+            lastPrice: old.lastPrice, migrationReport: MigrationReport(sourceSchemaVersion: old.schemaVersion,
+                sourceEntryCount: old.entries.count, migratedCount: entries.count, mappings: mappings, issues: issues))
+    }
+
+    static func validateLegacy(_ entry: LegacyEntry) throws {
+        guard entry.date.timeIntervalSinceReferenceDate.isFinite, entry.sequence >= 0,
+              entry.sequence < Int64.max, entry.note.count <= 10_000,
+              [entry.amountSats, entry.receivedSats, entry.feeSats].allSatisfy({ $0 >= 0 && $0 <= Amounts.maximumSats }),
+              ["cny", "usdt"].contains(entry.settlementCurrency ?? "cny"),
+              ["cny", "btc", "usdt"].contains(entry.feeCurrency) else {
+            throw LedgerError.invalid("旧记录日期、数量或币种字段无效。")
+        }
+        let cny = try Amounts.decimal(entry.amountCNY)
+        let feeCNY = try Amounts.decimal(entry.feeCNY)
+        let feeUSDT = try Amounts.decimal(entry.feeUSDT ?? "0", maxPlaces: 8)
+        _ = try Amounts.decimal(entry.amountUSDT ?? "0", maxPlaces: 8)
+        _ = try Amounts.decimal(entry.receivedUSDT ?? "0", maxPlaces: 8)
+        guard cny <= Amounts.maximumCNY, feeCNY <= Amounts.maximumCNY,
+              (entry.feeCurrency != "cny" || (entry.feeSats == 0 && feeUSDT == 0)),
+              (entry.feeCurrency != "btc" || (feeCNY == 0 && feeUSDT == 0)),
+              (entry.feeCurrency != "usdt" || (feeCNY == 0 && entry.feeSats == 0)) else {
+            throw LedgerError.invalid("旧记录金额或费用币种关系不明确。")
+        }
     }
 }

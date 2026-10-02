@@ -4,7 +4,6 @@ import LedgerCore
 struct LedgerPanel: Identifiable {
     enum Destination {
         case entry(EntryKind, LedgerEntry?)
-        case account(Account?)
         case detail(LedgerEntry)
         case rules
     }
@@ -14,11 +13,10 @@ struct LedgerPanel: Identifiable {
 
     var preferredSize: CGSize {
         switch destination {
-        case .entry(.adjustUSDT, _): CGSize(width: 650, height: 600)
-        case .entry: CGSize(width: 680, height: 760)
-        case .account: CGSize(width: 470, height: 340)
-        case .detail: CGSize(width: 650, height: 640)
-        case .rules: CGSize(width: 650, height: 670)
+        case .entry(.buy, _): CGSize(width: 580, height: 420)
+        case .entry(.transfer, _): CGSize(width: 600, height: 580)
+        case .detail: CGSize(width: 600, height: 420)
+        case .rules: CGSize(width: 650, height: 620)
         }
     }
 }
@@ -65,8 +63,6 @@ struct LedgerPanelOverlay: View {
         switch panel.destination {
         case .entry(let kind, let existing):
             EntryEditor(kind: kind, existing: existing, onDismiss: onDismiss)
-        case .account(let existing):
-            AccountEditor(existing: existing, onDismiss: onDismiss)
         case .detail(let entry):
             EntryDetail(entry: entry, onEdit: { onEdit(entry) }, onDismiss: onDismiss)
         case .rules:

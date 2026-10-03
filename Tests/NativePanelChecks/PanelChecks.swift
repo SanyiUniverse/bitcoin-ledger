@@ -56,6 +56,18 @@ private final class QAOfflineProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
+/// An intentional provider failure is local to the matrix's injected session.
+private final class QAUnavailableMarketProtocol: URLProtocol, @unchecked Sendable {
+    static let attempts = QANetworkAttempts()
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        Self.attempts.record()
+        client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+    }
+    override func stopLoading() {}
+}
+
 /// AppKit exposes gesture properties as read-only. This synthetic event supplies
 /// real responder methods with explicit phases without posting a global event.
 private final class QAMagnifyEvent: NSEvent {
@@ -115,7 +127,7 @@ struct ChartSizeScene: View {
     @MainActor static var preferences: UserDefaults!
     @MainActor static var preferenceSuite: String!
     @MainActor static func main() throws {
-        alarm(50)
+        alarm(120)
         defer { alarm(0) }
         guard let path = ProcessInfo.processInfo.environment["QA_OUTPUT"], path.hasPrefix("/"), path != "/" else { fatalError("absolute isolated QA_OUTPUT directory required") }
         output = URL(fileURLWithPath: path, isDirectory: true)
@@ -217,7 +229,7 @@ struct ChartSizeScene: View {
         let actual = host(ContentView(), store: store, size: NSSize(width: 1100, height: 800))
         waitForChart(in: actual)
         try snapshot(actual, name: "actual-home")
-        checkDashboardFit(actual, label: "default-1100x800")
+        checkDashboardFit(actual, label: "default-1100x800", minimumPlotHeight: 375)
         let initialNodes = accessibilityNodes(actual.contentView!)
         if let balance = initialNodes.first(where: { $0.accessibilityIdentifier() == "dashboard.balance" }) {
             record(!initialNodes.contains { $0.accessibilityIdentifier() == "dashboard.accounts" }, "account balances are collapsed by default")
@@ -271,9 +283,26 @@ struct ChartSizeScene: View {
         let actualSize = host(ContentView(), store: store, size: NSSize(width: 1147, height: 675))
         waitForChart(in: actualSize)
         try snapshot(actualSize, name: "actual-home-1147x675")
-        checkDashboardFit(actualSize, label: "actual-content-1147x675")
+        checkDashboardFit(actualSize, label: "actual-content-1147x675", minimumPlotHeight: 250)
         actualSize.close()
+        let compactDashboard = host(ContentView(), store: store, size: small)
+        waitForChart(in: compactDashboard)
+        try snapshot(compactDashboard, name: "actual-home-600x420")
+        try checkCompactDashboardScroll(compactDashboard)
+        compactDashboard.close()
+        let mediumDashboard = host(ContentView(), store: store, size: NSSize(width: 900, height: 675))
+        waitForChart(in: mediumDashboard)
+        try checkCompactDashboardScroll(mediumDashboard, label: "medium-900x675", snapshotName: "actual-home-900x675-scrolled")
+        mediumDashboard.close()
+        let darkDashboard = host(ContentView(), store: store, size: NSSize(width: 1147, height: 675), dark: true)
+        waitForChart(in: darkDashboard)
+        try snapshot(darkDashboard, name: "actual-home-dark-1147x675")
+        checkDashboardFit(darkDashboard, label: "dark-content-1147x675", minimumPlotHeight: 250)
+        darkDashboard.close()
+        try checkChartDetailsState(store: store)
         try checkChartResizeState(store: store)
+        try checkChartCombinationMatrix(store: store)
+        try checkChartRequestSwitching()
         checkNativeInputGestureBoundaries()
         for kind in EntryKind.allCases {
             let window = host(ProbeScene(probe: PanelProbe(), panel: LedgerPanel(destination: .entry(kind, nil))), store: store, size: NSSize(width: 800, height: 650))
@@ -508,17 +537,116 @@ struct ChartSizeScene: View {
     @MainActor static func writeSyntheticMarketCache(in folder: URL) throws {
         let now = Date()
         let midnight = MarketHistory.utcCalendar.startOfDay(for: now)
+        let references = (0..<60).map { index in
+            let price = Decimal(25_000 + index * 50)
+            return MarketCandle(closeDate: midnight.addingTimeInterval(-Double(89 - index) * 86_400), interval: 86_400,
+                                open: price, high: price, low: price, close: price, hasOHLC: false)
+        }
         let candles = (0..<30).map { index in
             let price = Decimal(85_000 + index * 100)
             return MarketCandle(closeDate: midnight.addingTimeInterval(-Double(29 - index) * 86_400), interval: 86_400,
                                 open: price, high: price + 200, low: price - 200, close: price + (index.isMultiple(of: 2) ? 100 : -100))
         }
-        let history = MarketHistory(range: .all, fetchedAt: now, candles: candles, source: "合成离线日行情")
+        let history = MarketHistory(range: .all, fetchedAt: now, candles: references + candles, source: "合成离线日行情")
         try JSONEncoder().encode([history]).write(to: folder.appendingPathComponent("market-history-daily-usd-v1.json"), options: .atomic)
-        report.append("FIXTURE 30 synthetic daily OHLC candles; fresh cache next to the isolated QA ledger; network blocked.")
+        report.append("FIXTURE 60 synthetic early reference closes and 30 daily OHLC candles; fresh cache next to the isolated QA ledger; network blocked.")
     }
-    @MainActor static func checkDashboardFit(_ window: NSWindow, label: String) {
+    @MainActor static func checkChartCombinationMatrix(store: AppStore) throws {
+        let folder = output.appendingPathComponent("matrix-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let now = Date()
+        let observedThrough = Date(timeIntervalSince1970: floor(now.timeIntervalSince1970 / 60) * 60)
+        for period in MarketPeriod.allCases where period.isIntraday || period == .day {
+            let seconds = period.nominalSeconds
+            let first = max(MarketRange.genesisDate,
+                            Date(timeIntervalSince1970: floor(observedThrough.timeIntervalSince1970 / seconds) * seconds - 15_998 * seconds))
+            let bars = stride(from: first.timeIntervalSince1970, to: observedThrough.timeIntervalSince1970, by: seconds).map { timestamp in
+                let end = min(observedThrough, Date(timeIntervalSince1970: timestamp + seconds))
+                let value = Decimal(70_000 + Int(timestamp / seconds).quotientAndRemainder(dividingBy: 100).remainder)
+                return MarketCandle(closeDate: end, interval: end.timeIntervalSince1970 - timestamp,
+                    open: value, high: value + 100, low: value - 100, close: value + 20,
+                    isComplete: end.timeIntervalSince1970 == timestamp + seconds)
+            }
+            let history = MarketHistory(range: .all, period: period, fetchedAt: now,
+                candles: bars, source: "合成全周期离线行情")
+            let bytes: Data
+            if period == .day { bytes = try JSONEncoder().encode([history]) }
+            else {
+                bytes = try JSONEncoder().encode(BTCMarketCacheRecord(period: period,
+                    from: first, through: now, history: history, nativeGranularity: 60))
+            }
+            try bytes.write(to: folder.appendingPathComponent(BTCChartModel.fileName(period: period)))
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [QAUnavailableMarketProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let model = BTCChartModel(cacheDirectory: folder, client: MarketHistoryClient(session: session))
+        let cache = BTCPlotCache()
+        var supported = 0, limited = 0
+        let matrixError = runAsync {
+            for range in MarketRange.allCases {
+                for period in MarketPeriod.allCases {
+                let expected = BTCChartViewport(start: range.startDate(today: now), end: now)
+                let base = [60, 300, 900, 3600, 21_600].last {
+                    Int(period.nominalSeconds) % $0 == 0 && Double($0) <= expected.duration
+                } ?? 60
+                let first = floor(expected.start.timeIntervalSince1970 / period.nominalSeconds) * period.nominalSeconds
+                let last = floor(now.timeIntervalSince1970 / Double(base)) * Double(base)
+                let exceeds = period.isIntraday && (ceil((last - first) / period.nominalSeconds) > 16_000
+                                                    || (last - first) / Double(base) > 100_000)
+                await model.load(period: period, window: expected)
+                let history = model.matchingHistory(period: period, window: expected)
+                if exceeds {
+                    limited += 1
+                    record(history == nil
+                           && model.rejected == BTCChartLoad(period: period, window: expected)
+                           && model.error?.contains("数据量") == true,
+                           "matrix \(range.title) / \(period.title): explicit limit never substitutes the previous plot")
+                } else {
+                    supported += 1
+                    let data = history.map { cache.data(history: $0, key: BTCPlotCacheKey(
+                        historyRevision: model.historyRevision, accounts: [], entries: [], range: range,
+                        period: period, window: expected, priceWindow: nil)) }
+                    record(data?.window == expected && data?.period == period
+                           && data?.candles.isEmpty == false && data?.visibleOHLCDomain.map {
+                               data!.yDomain.lowerBound <= $0.lowerBound && data!.yDomain.upperBound >= $0.upperBound
+                           } == true && model.rejected == nil,
+                           "matrix \(range.title) / \(period.title): production plot uses exact selected dates and period with nonempty bars and fitted prices")
+                }
+                }
+            }
+        }
+        record(matrixError == nil && supported + limited == 153,
+               "all 9 time ranges x 17 periods checked: \(supported) supported and \(limited) explicitly limited combinations")
+        for period in MarketPeriod.allCases {
+            let expected = BTCChartViewport(start: now.addingTimeInterval(-3600), end: now)
+            _ = runAsync { await model.load(period: period, window: expected) }
+            let window = host(BTCChartView(expandedChart: .constant(false), range: .hour,
+                period: period, today: now, model: model), store: store, size: NSSize(width: 900, height: 450))
+            let plot = nativePlotInputs(window.contentView!).first?.snapshot
+            let labels = Set(nativePopups(window.contentView!).map(\.title))
+            let passes = labels.contains(MarketRange.hour.title) && labels.contains(period.title)
+                && plot?.timeWindow == expected.start...expected.end && plot?.period == period
+                && (plot?.visibleCandleCount ?? 0) > 0 && fittedOHLC(plot)
+            record(passes, "native one-hour viewport / \(period.title): selections, time span, period and visible OHLC match")
+            if !passes { report.append("MATRIX_DIAGNOSTIC \(period.rawValue): titles=\(labels) snapshot=\(String(describing: plot)) error=\(model.error ?? "none")") }
+            if period == .hour12 || period == .year { try snapshot(window, name: "chart-short-\(period.rawValue)") }
+            window.contentView = nil
+            window.close()
+        }
+        let previous = BTCChartViewport(start: now.addingTimeInterval(-86400), end: now)
+        _ = runAsync { await model.load(period: .minute, window: previous) }
+        let unavailable = BTCChartViewport(start: MarketRange.genesisDate, end: MarketRange.genesisDate.addingTimeInterval(3600))
+        _ = runAsync { await model.load(period: .minute, window: unavailable) }
+        record(model.matchingHistory(period: .minute, window: unavailable) == nil
+               && model.rejected == BTCChartLoad(period: .minute, window: unavailable)
+               && QAUnavailableMarketProtocol.attempts.count == 1,
+               "a failed older request cannot reuse a recent cache of the same period outside its coverage")
+    }
+    @MainActor static func checkDashboardFit(_ window: NSWindow, label: String, minimumPlotHeight: CGFloat) {
         let root = window.contentView!
+        logChartPlotRects(window, label: label)
         guard let scroll = nativeScrollViews(root).filter({ $0.bounds.width > root.bounds.width / 2 }).max(by: { $0.bounds.width < $1.bounds.width }),
               let document = scroll.documentView else {
             record(false, "\(label): dashboard scroll container discoverable")
@@ -528,7 +656,8 @@ struct ChartSizeScene: View {
         report.append("LAYOUT \(label): content=\(root.bounds.size) document=\(document.frame.size) clip=\(scroll.contentView.bounds.size)")
         record(document.frame.height <= visibleHeight + 1, "\(label): complete dashboard document fits visible height without vertical scrolling")
         let plots = nativePlotInputs(root)
-        record(plots.count == 1 && plots.allSatisfy { controlFits($0, in: window) && $0.bounds.height >= 59 }, "\(label): real cached chart plot is visible and contained in one screen")
+        record(plots.count == 1 && plots.allSatisfy { controlFits($0, in: window) && $0.bounds.height >= minimumPlotHeight },
+               "\(label): real cached chart plot occupies at least \(minimumPlotHeight) points of visible height without clipping")
         let priceAxes = nativePriceAxisInputs(root)
         record(priceAxes.count == 1 && priceAxes.allSatisfy { axis in
             guard let plot = plots.first else { return false }
@@ -543,16 +672,60 @@ struct ChartSizeScene: View {
             report.append("SCOPE \(label): hidden hosting window does not expose SwiftUI drag registration; native payload and guarded order logic are checked, and full drag gesture needs installed-app verification.")
         }
     }
+    @MainActor static func checkCompactDashboardScroll(_ window: NSWindow, label: String = "compact-600x420",
+                                                      snapshotName: String = "actual-home-600x420-scrolled") throws {
+        let root = window.contentView!
+        logChartPlotRects(window, label: label)
+        guard let scroll = nativeScrollViews(root).filter({ $0.bounds.width > root.bounds.width / 2 }).max(by: { $0.bounds.width < $1.bounds.width }),
+              let document = scroll.documentView else {
+            record(false, "\(label): dashboard scroll container discoverable")
+            return
+        }
+        record(document.frame.height > scroll.contentView.bounds.height + 1,
+               "\(label): readable dashboard keeps overflowing content in a vertical scroll container")
+        let actions = nativeButtons(scroll).filter {
+            !$0.isHiddenOrHasHiddenAncestor && $0.isEnabled && !($0 is NSPopUpButton) && $0.bounds.width > 60
+        }.sorted { $0.convert($0.bounds, to: nil).minX < $1.convert($1.bounds, to: nil).minX }
+        record(actions.count >= 2 && actions.prefix(2).allSatisfy { control in
+            _ = control.scrollToVisible(control.bounds)
+            return controlFits(control, in: window)
+                && scroll.contentView.bounds.contains(control.convert(control.bounds, to: scroll.contentView))
+        }, "\(label): purchase and transfer actions can be fully revealed inside the scroll viewport")
+        guard let plot = nativePlotInputs(root).first else {
+            record(false, "\(label): cached chart remains in scrollable dashboard")
+            return
+        }
+        record(plot.bounds.height >= 140,
+               "\(label): scrollable chart keeps at least 140 points of readable plot height")
+        _ = plot.scrollToVisible(plot.bounds)
+        settle()
+        record(controlFits(plot, in: window)
+               && scroll.contentView.bounds.contains(plot.convert(plot.bounds, to: scroll.contentView)),
+               "\(label): cached chart is fully reachable inside the scroll viewport")
+        logChartPlotRects(window, label: "\(label)-scrolled")
+        try snapshot(window, name: snapshotName)
+    }
+    @MainActor static func logChartPlotRects(_ window: NSWindow, label: String) {
+        let root = window.contentView!
+        for (index, plot) in nativePlotInputs(root).enumerated() {
+            let rect = plot.convert(plot.bounds, to: root)
+            let entry = "PLOT \(label)[\(index)]: rect=\(rect) width=\(plot.bounds.width) height=\(plot.bounds.height)"
+            report.append(entry)
+            print(entry)
+        }
+    }
     @MainActor static func checkMetricOrdering() {
-        let defaults: [DashboardMetric] = [.marketValue, .invested, .cost, .profit, .profitRatio, .purchased, .loss, .currentPrice]
-        record(DashboardMetric.ordered(from: "") == defaults, "metric default order preserves seven requested columns and appends current BTC price")
-        let recovered = DashboardMetric.ordered(from: "loss,profit,loss,unknown")
+        let defaults: [DashboardMetric] = [.cost, .marketValue, .profit, .profitRatio]
+        record(DashboardMetric.ordered(from: "") == defaults, "metric default order presents actual cash cost, current value, unrealized profit and profit ratio")
+        record(DashboardMetric.storageKey == "dashboard.metricOrder.v2", "revised summary starts with its requested layout independently of legacy metric preferences")
+        let recovered = DashboardMetric.ordered(from: "profitRatio,profit,profitRatio,unknown")
         record(recovered.count == defaults.count && Set(recovered).count == defaults.count
-               && Array(recovered.prefix(2)) == [.loss, .profit] && Set(recovered) == Set(defaults),
+               && Array(recovered.prefix(2)) == [.profitRatio, .profit] && Set(recovered) == Set(defaults),
                "stored metric order removes duplicates and unknown IDs while retaining every required metric")
-        let legacy = defaults.filter { $0 != .currentPrice }.map(\.rawValue).joined(separator: ",")
-        record(DashboardMetric.ordered(from: legacy) == defaults, "older seven-column preference gains current price without changing existing order")
-        let drag = DashboardMetricDrag(.loss)
+        let legacy = "marketValue,invested,cost,profit,profitRatio,purchased,loss,currentPrice"
+        record(DashboardMetric.ordered(from: legacy) == [.marketValue, .cost, .profit, .profitRatio],
+               "obsolete purchase-total and auxiliary IDs cannot reappear as summary metrics")
+        let drag = DashboardMetricDrag(.profitRatio)
         let provider = drag.itemProvider()
         record(provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
                && provider.canLoadObject(ofClass: NSString.self), "native metric drag provider supports the typed text drop API")
@@ -564,20 +737,20 @@ struct ChartSizeScene: View {
             return
         }
         record(loaded == drag.token, "native drag provider round-trips its active local token")
-        guard let reordered = drag.reordered([loaded], rawOrder: "", target: .marketValue) else {
+        guard let reordered = drag.reordered([loaded], rawOrder: "", target: .cost) else {
             record(false, "active native drag reorders its target")
             return
         }
-        record(DashboardMetric.ordered(from: reordered).first == .loss
+        record(DashboardMetric.ordered(from: reordered).first == .profitRatio
                && Set(DashboardMetric.ordered(from: reordered)) == Set(defaults), "active metric drag changes placement without deleting or duplicating a value")
         record(drag.reordered(["BitcoinLedger.metric.unknown"], rawOrder: "", target: .cost) == nil
-               && drag.reordered([DashboardMetricDrag(.loss).token], rawOrder: "", target: .cost) == nil
+               && drag.reordered([DashboardMetricDrag(.profitRatio).token], rawOrder: "", target: .cost) == nil
                && drag.reordered([loaded, loaded], rawOrder: "", target: .cost) == nil,
                "foreign, unknown, stale-session and multiple drag tokens cannot reorder metrics")
         preferences.set(reordered, forKey: DashboardMetric.storageKey)
         let reopened = UserDefaults(suiteName: preferenceSuite)!
         record(reopened.string(forKey: DashboardMetric.storageKey) == reordered
-               && DashboardMetric.ordered(from: reopened.string(forKey: DashboardMetric.storageKey) ?? "").first == .loss,
+               && DashboardMetric.ordered(from: reopened.string(forKey: DashboardMetric.storageKey) ?? "").first == .profitRatio,
                "custom metric order persists through a fresh isolated UserDefaults instance")
         preferences.removeObject(forKey: DashboardMetric.storageKey)
         record(DashboardMetric.profitColor(1) == .green && DashboardMetric.profitColor(-1) == .red
@@ -593,6 +766,49 @@ struct ChartSizeScene: View {
     }
     static func priceSpan(_ state: BTCChartInputSnapshot) -> Double {
         state.priceDomain.upperBound - state.priceDomain.lowerBound
+    }
+    @MainActor static func checkChartDetailsState(store: AppStore) throws {
+        let probe = ChartSizeProbe()
+        let window = host(ChartSizeScene(probe: probe), store: store, size: NSSize(width: 900, height: 600))
+        defer { window.close() }
+        waitForChart(in: window)
+        guard let plot = nativePlotInputs(window.contentView!).first, let initial = plot.snapshot else {
+            record(false, "latest-details fixture contains real cached plot")
+            return
+        }
+        record(initial.detailsDate == nil && initial.detailsSats == store.snapshot?.totalSats
+               && initial.detailsPriceUSD == store.quote?.priceUSD
+               && initial.detailsInvestedUSD == store.snapshot?.totalInvestedUSD,
+               "chart summary defaults to latest ledger holdings and current quote rather than the last historical close")
+        let oldPoint = CGPoint(x: plot.bounds.width * 0.2, y: plot.bounds.midY)
+        let oldLocation = plot.convert(oldPoint, to: nil)
+        plot.mouseMoved(with: mouseEvent(.mouseMoved, window: window, location: oldLocation))
+        settle()
+        record(plot.snapshot?.detailsDate != nil && plot.snapshot?.detailsSats == 0
+               && plot.snapshot?.detailsInvestedUSD == 0
+               && plot.snapshot?.detailsPriceUSD != nil && plot.snapshot?.detailsPriceUSD != initial.detailsPriceUSD,
+               "native pointer movement shows historical holdings and historical market price before the synthetic purchase")
+        try snapshot(window, name: "chart-details-history")
+        let exit = NSEvent.enterExitEvent(with: .mouseExited, location: oldLocation, modifierFlags: [],
+                                         timestamp: ProcessInfo.processInfo.systemUptime,
+                                         windowNumber: window.windowNumber, context: nil,
+                                         eventNumber: 0, trackingNumber: 0, userData: nil)!
+        plot.mouseExited(with: exit)
+        settle()
+        record(plot.snapshot?.detailsDate == nil && plot.snapshot?.detailsSats == initial.detailsSats
+               && plot.snapshot?.detailsPriceUSD == initial.detailsPriceUSD
+               && plot.snapshot?.detailsInvestedUSD == initial.detailsInvestedUSD,
+               "leaving the plot immediately restores latest holdings and current quote")
+        plot.mouseMoved(with: mouseEvent(.mouseMoved, window: window, location: oldLocation))
+        settle()
+        record(plot.snapshot?.detailsDate != nil, "a second pointer movement re-enters historical inspection")
+        RunLoop.main.run(until: Date().addingTimeInterval(1.4))
+        settle()
+        record(plot.snapshot?.detailsDate == nil && plot.snapshot?.detailsSats == initial.detailsSats
+               && plot.snapshot?.detailsPriceUSD == initial.detailsPriceUSD
+               && plot.snapshot?.detailsInvestedUSD == initial.detailsInvestedUSD,
+               "stopping the pointer inside the plot restores latest holdings and quote after the idle delay")
+        try snapshot(window, name: "chart-details-latest")
     }
     @MainActor static func checkChartResizeState(store: AppStore) throws {
         let probe = ChartSizeProbe()
@@ -613,11 +829,11 @@ struct ChartSizeScene: View {
         }
         record(timeSpan(zoomed) < timeSpan(initial) && !zoomed.manualPriceScale && fittedOHLC(zoomed),
                "plot magnify shrinks time range while fitting every visible OHLC inside the price domain")
-        plot.onPan?(30); settle()
+        plot.onPan?(plot.bounds.width * 0.4); settle()
         let panned = plot.snapshot
-        record(panned?.timeWindow != zoomed.timeWindow && panned?.priceDomain == zoomed.priceDomain
-               && panned?.manualPriceScale == false,
-               "horizontal plot pan moves time but locks the current price range without marking a manual price scale")
+        record(panned?.timeWindow != zoomed.timeWindow && panned?.priceDomain != zoomed.priceDomain
+               && panned?.manualPriceScale == false && fittedOHLC(panned),
+               "horizontal plot pan moves time and refits the automatic price range to all visible OHLC")
         plot.onMagnify?(0.8, plot.bounds.center); settle()
         record(fittedOHLC(plot.snapshot) && plot.snapshot?.manualPriceScale == false,
                "explicit plot zoom after panning refits nonempty visible OHLC")
@@ -646,13 +862,19 @@ struct ChartSizeScene: View {
         record(timeSpan(manualTimeZoom) < timeSpan(cumulative)
                && manualTimeZoom.priceDomain == cumulative.priceDomain && manualTimeZoom.manualPriceScale,
                "time zoom preserves a manually adjusted price domain")
+        plot.onPan?(plot.bounds.width * 0.1); settle()
+        let manualPan = plot.snapshot!
+        record(manualPan.timeWindow != manualTimeZoom.timeWindow
+               && manualPan.priceDomain == manualTimeZoom.priceDomain && manualPan.manualPriceScale,
+               "time pan preserves a manually adjusted price domain")
         axis.mouseDown(with: mouseEvent(.leftMouseDown, window: window, location: axisCenter, clicks: 2))
         settle()
         let reset = plot.snapshot!
-        record(reset.timeWindow == manualTimeZoom.timeWindow && !reset.manualPriceScale && fittedOHLC(reset),
+        record(reset.timeWindow == manualPan.timeWindow && !reset.manualPriceScale && fittedOHLC(reset),
                "native price-axis double click restores visible OHLC fit without resetting the time viewport")
         let pickerIDs = Set(nativePopups(window.contentView!).map { ObjectIdentifier($0) })
         let selections = nativePopups(window.contentView!).map(\.indexOfSelectedItem)
+        let commandIDs = Set(nativeButtons(window.contentView!).filter { !($0 is NSPopUpButton) }.map { ObjectIdentifier($0) })
         let plotID = ObjectIdentifier(plot)
         let originalHeight = plot.bounds.height
         try snapshot(window, name: "chart-size-zoomed")
@@ -660,6 +882,8 @@ struct ChartSizeScene: View {
         record(!pickerIDs.isEmpty && Set(nativePopups(window.contentView!).map { ObjectIdentifier($0) }) == pickerIDs
                && nativePopups(window.contentView!).map(\.indexOfSelectedItem) == selections,
                "expanding chart preserves actual native picker instances and selections")
+        record(!commandIDs.isEmpty && Set(nativeButtons(window.contentView!).filter { !($0 is NSPopUpButton) }.map { ObjectIdentifier($0) }) == commandIDs,
+               "expanding chart preserves native navigation, zoom, reset and action button instances")
         record(nativePlotInputs(window.contentView!).first.map { ObjectIdentifier($0) == plotID && $0.bounds.height > originalHeight + 100 } == true,
                "expanding chart grows the existing native plot instead of recreating it")
         record(plot.snapshot == reset && axis.snapshot == reset,
@@ -670,9 +894,23 @@ struct ChartSizeScene: View {
                && nativePopups(window.contentView!).map(\.indexOfSelectedItem) == selections
                && nativePlotInputs(window.contentView!).first.map { ObjectIdentifier($0) == plotID } == true,
                "collapsing chart retains actual picker and plot instances")
+        record(Set(nativeButtons(window.contentView!).filter { !($0 is NSPopUpButton) }.map { ObjectIdentifier($0) }) == commandIDs,
+               "collapsing chart preserves native navigation, zoom, reset and action button instances")
         record(plot.snapshot == reset && axis.snapshot == reset,
                "collapsing the existing chart preserves its real time and price viewport")
         try snapshot(window, name: "chart-size-collapsed")
+        plot.onMagnify?(4, plot.bounds.center); settle()
+        let mixedHistory = plot.snapshot!
+        record(!mixedHistory.manualPriceScale && fittedOHLC(mixedHistory)
+               && mixedHistory.priceDomain.upperBound > 80_000,
+               "widening time fits both recent OHLC and synthetic early reference closes")
+        plot.onPan?(plot.bounds.width * 0.9); settle()
+        let earlyHistory = plot.snapshot!
+        record(earlyHistory.timeWindow != mixedHistory.timeWindow && !earlyHistory.manualPriceScale
+               && earlyHistory.visibleOHLCCount == 0 && earlyHistory.priceDomain != mixedHistory.priceDomain
+               && earlyHistory.priceDomain.lowerBound > 20_000 && earlyHistory.priceDomain.upperBound < 30_000,
+               "panning into reference-close history replaces the recent price scale with the lower early-market scale")
+        try snapshot(window, name: "chart-early-reference-fit")
     }
     @MainActor static func checkNativeInputGestureBoundaries() {
         let root = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))

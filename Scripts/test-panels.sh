@@ -10,7 +10,7 @@ cp "$PROJECT_DIR"/Sources/LedgerCore/*.swift "$QA_PACKAGE/Sources/LedgerCore/"
 for source in AppStore ContentView DetailViews Editors PanelPresentation BTCChartView BTCChartInput; do
     cp "$PROJECT_DIR/Sources/BitcoinLedger/$source.swift" "$QA_PACKAGE/Sources/PanelQA/"
 done
-cp "$PROJECT_DIR/Tests/NativePanelChecks/PanelChecks.swift" "$QA_PACKAGE/Sources/PanelQA/"
+cp "$PROJECT_DIR"/Tests/NativePanelChecks/*.swift "$QA_PACKAGE/Sources/PanelQA/"
 cat > "$QA_PACKAGE/Package.swift" <<'SWIFT'
 // swift-tools-version: 6.0
 import PackageDescription

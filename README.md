@@ -1,23 +1,25 @@
 # Bitcoin Ledger
 
-本机 BTC 记账软件，只记录「购买」和「转移」。打开 `/Applications/Bitcoin Ledger.app` 使用；最低 macOS 14，当前打包用于 Apple Silicon。
+本机 BTC 账本，只记录购买和转移；最低 macOS 14，适用于 Apple Silicon。
 
-- **购买**：日期时间（精确到分钟）、实际投入人民币、实际获得 BTC、到账账户；默认欧易。
-- **转移**：日期时间（精确到分钟）、来源、目标、转出 BTC、实际到账 BTC、可选备注；默认欧易 → 自有钱包。转出与到账之差计入损耗，不增加投入。
-- **总览**：总持有、购买 / 转移、美元市价、市值、累计投入、购买、损耗、综合成本与盈亏合并显示；右侧指标可拖动调整顺序，盈亏绿正红负；点击总持有 BTC 展开或收起账户余额。默认窗口一屏容纳总览与图表，极小窗口可滚动。
-- **历史**：查看、编辑、删除记录；保存前重算全部历史，余额不足时拒绝修改。
+从 [Releases](https://github.com/SanyiUniverse/bitcoin-ledger/releases/latest) 下载 ZIP，解压后将 `Bitcoin Ledger.app` 放入 `/Applications` 并打开。
 
-价格、投入、成本、市值和盈亏统一用美元。购买依然输入人民币，后台使用购买时可用的历史参考汇率换算并固定保存，同时保留原人民币金额。它采用每日参考汇率，不冒充当时银行成交汇率。
+- **购买**：输入日期时间、实际投入人民币、实际到账 BTC 和账户；默认欧易。
+- **转移**：输入来源、目标、转出及到账 BTC；差额计入损耗，不增加投入。默认欧易 → 自有钱包。
+- **总览**：显示总持有、总成本、市值、浮盈和浮盈率。按钮旁先显示成本金额，后接小号「总成本」；右侧三项可拖动排序，市价与损耗横排在下方，宽窗与购买 / 转移处于同一底行。点击总持有展开钱包余额。
+- **历史**：查看、编辑、删除记录；保存前验证完整历史，拒绝造成余额不足的修改。
 
-K 线叠加动态综合成本及购买 / 转移事件。历史数字紧凑排列在周期选择旁，点击图外收起。双指横移平移，图内捏合围绕指针缩放时间；右侧价格轴可独立拖动缩放，双击自动适配；点击图后 ← / → 每次移动一根当前周期，平移保持纵轴比例。可展开图幅、缩放、重置，自选起止日期。
+购买以人民币输入，成本与行情以美元显示。每笔购买按当时已可用的每日参考汇率换算并固定保存；刷新行情不改变投入。计算与旧账本迁移见 [Accounting](Docs/Accounting.md)。
 
-周期：1 / 3 / 5 / 15 / 30 分钟，1 / 2 / 4 / 6 / 8 / 12 小时，日、3 日、周、月、3 月、年。较细周期按所选历史时间请求真实交易所 OHLC；过大请求明确提示缩小范围或加长周期。全部日历史视窗从创世日起显示，无可靠价格的日期留空，只有真实收盘的日期画参考线。详见 [行情说明](Docs/PriceAPI.md)。
+K 线叠加每 BTC 成本和购买 / 转移事件，支持分钟至年共 17 种周期及自选日期。摘要默认显示当前状态；移动鼠标查看历史，停下约 1.2 秒或移开后恢复。双指横移平移、图内捏合缩放时间；点击图后用 ← / → 移动。自动价格轴适配可见数据，右侧价格轴可独立拖动缩放、双击复位。正常窗口一屏显示，小窗口可滚动。
 
-账本仅保存在 `~/Library/Application Support/Bitcoin Ledger/ledger.json`。菜单支持 JSON 完整备份 / 恢复和 CSV 历史导出。升级前保留旧文件原始副本，无法确定的旧记录进入迁移报告，不猜数据。详见 [计算与迁移](Docs/Accounting.md)。行情请求不发送账户、金额或持仓；无需 API Key、账户或订阅。
+行情只使用真实 OHLC 或标明来源的参考收盘，缺失不补造；失败或超限会提示。来源、范围限制与缓存规则见 [PriceAPI](Docs/PriceAPI.md)。
 
-## 开发
+账本保存在 `~/Library/Application Support/Bitcoin Ledger/ledger.json`。菜单支持 JSON 完整备份 / 恢复与 CSV 导出；升级和导入保留原始备份。行情请求不发送账本金额、账户或持仓，无需 API Key 或订阅。
 
-使用 Apple SwiftUI、AppKit、Foundation、Charts 与 Swift Testing，没有第三方依赖。
+## 构建与验证
+
+使用 Apple SwiftUI、AppKit、Foundation、Charts、Swift Testing，无第三方依赖。安装 Command Line Tools 后运行：
 
 ```sh
 ./Scripts/test.sh
@@ -25,4 +27,4 @@ K 线叠加动态综合成本及购买 / 转移事件。历史数字紧凑排列
 ./Scripts/build-app.sh
 ```
 
-构建脚本在上一级目录生成 `Bitcoin Ledger.zip`。使用已安装 Command Line Tools，优先可用的 26.5 SDK，不修改系统开发设置；隔离测试与临时打包目录自动清理。维护细节见 [架构](Docs/Architecture.md) 和 [验证状态](Docs/Validation.md)。
+构建输出上一级目录的 `Bitcoin Ledger.zip`。更新时先退出应用，再替换 `/Applications/Bitcoin Ledger.app`；账本独立保存。`--install` 仅用于尚未安装的机器，不覆盖已有应用。维护说明见 [Architecture](Docs/Architecture.md)，当前结果见 [Validation](Docs/Validation.md)。

@@ -2,25 +2,50 @@ import SwiftUI
 import Charts
 import LedgerCore
 
-private struct BTCChartLoad: Equatable, Hashable, Sendable {
+struct BTCChartLoad: Equatable, Hashable, Sendable {
     let period: MarketPeriod
     let window: BTCChartViewport
     var sourcePeriod: MarketPeriod { period.isIntraday ? period : .day }
+    func validate(now: Date = Date()) throws {
+        guard window.start.timeIntervalSince1970.isFinite, window.end.timeIntervalSince1970.isFinite,
+              window.start >= MarketRange.genesisDate, window.start < window.end,
+              window.end <= now else { throw MarketHistoryError.invalidRange }
+        if sourcePeriod.isIntraday {
+            _ = try MarketHistoryClient.intradayPlan(period: sourcePeriod, from: window.start, through: window.end, now: now)
+        }
+    }
 }
 
-private struct BTCMarketCacheRecord: Codable {
+struct BTCMarketCacheRecord: Codable {
     let period: MarketPeriod
     let from: Date
     let through: Date
     let history: MarketHistory
+    var nativeGranularity: Int? = nil
     var window: BTCChartViewport { BTCChartViewport(start: from, end: through) }
-    func covers(_ load: BTCChartLoad) -> Bool {
-        period == load.sourcePeriod && (!period.isIntraday || from <= load.window.start && through >= load.window.end)
+    func covers(_ load: BTCChartLoad, now: Date = Date()) -> Bool {
+        // Allow 60 seconds of drift at the current tail.
+        let currentTail = abs(load.window.end.timeIntervalSince(now)) <= 60
+            && through >= load.window.end.addingTimeInterval(-60)
+        guard period == load.sourcePeriod else { return false }
+        // Refresh a daily cache that predates the selected window.
+        guard period.isIntraday else { return through >= load.window.start }
+        guard from <= load.window.start, through >= load.window.end || currentTail,
+              let plan = try? MarketHistoryClient.intradayPlan(period: period,
+                from: load.window.start, through: load.window.end, now: now) else { return false }
+        // An aggregate cannot be split at a historical cutoff.
+        guard !history.candles.contains(where: {
+            $0.startDate < load.window.end && $0.closeDate > load.window.end
+        }) else { return false }
+        // Narrow windows need finer sources; unknown legacy precision refreshes.
+        let cachedGranularity = nativeGranularity ?? Int(period.nominalSeconds)
+        return cachedGranularity > 0 && cachedGranularity <= plan.granularity
+            && plan.granularity % cachedGranularity == 0
     }
 }
 
 @MainActor
-private final class BTCChartModel: ObservableObject {
+final class BTCChartModel: ObservableObject {
     @Published var history: MarketHistory? { didSet { historyRevision += 1 } }
     private(set) var historyRevision = 0
     @Published var loading = false
@@ -32,27 +57,32 @@ private final class BTCChartModel: ObservableObject {
     private var lastAttempt: [BTCChartLoad: Date] = [:]
     private var lastPeriodAttempt: [MarketPeriod: Date] = [:]
     private var requested: BTCChartLoad?
+    private var requestRevision = 0
     private var activeLoad: BTCChartLoad?
-    private var fetchTask: Task<(MarketHistory, BTCChartViewport), Error>?
+    private var fetchTask: Task<(MarketHistory, BTCChartViewport, Int?), Error>?
     private var nextRequestAt = Date.distantPast
     private var rateLimitFailures = 0
+    private var displayedRecord: BTCMarketCacheRecord?
     private let cacheDirectory: URL?
-    private let client = MarketHistoryClient()
+    private let client: MarketHistoryClient
 
     static func fileName(period: MarketPeriod) -> String {
         if !period.isIntraday { return "market-history-daily-usd-v1.json" }
         if period == .minute { return "market-history-minute-usd-v1.json" }
         return "market-history-intraday-\(period.rawValue)-usd-v1.json"
     }
-    init() {
-        if let path = ProcessInfo.processInfo.environment["BITCOIN_LEDGER_DATA_PATH"] {
-            cacheDirectory = URL(fileURLWithPath: path).deletingLastPathComponent()
+    init(cacheDirectory: URL? = nil, client: MarketHistoryClient = MarketHistoryClient()) {
+        self.client = client
+        if let cacheDirectory {
+            self.cacheDirectory = cacheDirectory
+        } else if let path = ProcessInfo.processInfo.environment["BITCOIN_LEDGER_DATA_PATH"] {
+            self.cacheDirectory = URL(fileURLWithPath: path).deletingLastPathComponent()
         } else {
-            cacheDirectory = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+            self.cacheDirectory = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                 appropriateFor: nil, create: true).appendingPathComponent("Bitcoin Ledger", isDirectory: true)
         }
         for period in MarketPeriod.allCases where period.isIntraday || period == .day {
-            guard let url = cacheDirectory?.appendingPathComponent(Self.fileName(period: period)), FileManager.default.fileExists(atPath: url.path) else { continue }
+            guard let url = self.cacheDirectory?.appendingPathComponent(Self.fileName(period: period)), FileManager.default.fileExists(atPath: url.path) else { continue }
             do {
                 let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
                 guard size <= 8_000_000 else { throw MarketHistoryError.invalidResponse }
@@ -75,6 +105,10 @@ private final class BTCChartModel: ObservableObject {
               record.through.timeIntervalSince1970.isFinite, !item.candles.isEmpty,
               item.candles.count <= (record.period.isIntraday ? 16000 : 10000),
               item.fetchedAt <= Date().addingTimeInterval(300), item.fetchedAt.timeIntervalSinceReferenceDate.isFinite else { return false }
+        if record.period.isIntraday, let nativeGranularity = record.nativeGranularity {
+            guard [60, 300, 900, 3600, 21600].contains(nativeGranularity),
+                  Int(record.period.nominalSeconds) % nativeGranularity == 0 else { return false }
+        }
         var previous = Date.distantPast
         for candle in item.candles {
             guard MarketHistoryClient.valid(candle), candle.closeDate > previous,
@@ -89,63 +123,85 @@ private final class BTCChartModel: ObservableObject {
         return true
     }
     private func publish(_ record: BTCMarketCacheRecord, for load: BTCChartLoad) {
-        history = record.history; coverageWindow = record.window; displayedWindow = load.window
+        displayedRecord = record; coverageWindow = record.window; displayedWindow = load.window
+        history = record.history
         rejected = nil; error = record.history.warning
+    }
+    func matchingHistory(for load: BTCChartLoad) -> MarketHistory? {
+        guard (try? load.validate()) != nil, let displayedRecord, displayedRecord.covers(load) else { return nil }
+        return displayedRecord.history
+    }
+    func matchingHistory(period: MarketPeriod, window: BTCChartViewport) -> MarketHistory? {
+        matchingHistory(for: BTCChartLoad(period: period, window: window))
     }
     func load(period: MarketPeriod = .day, window: BTCChartViewport, force: Bool = false) async {
         guard !Task.isCancelled else { return }
         let load = BTCChartLoad(period: period, window: window)
+        requestRevision += 1
+        let revision = requestRevision
         requested = load
         if loading, activeLoad != load { fetchTask?.cancel() }
         let sourcePeriod = load.sourcePeriod
-        if !sourcePeriod.isIntraday || window.duration / sourcePeriod.nominalSeconds <= 16000 {
-            if let previous = cached[sourcePeriod], previous.covers(load) {
-                publish(previous, for: load)
-                if !force, Date().timeIntervalSince(previous.history.fetchedAt) < (sourcePeriod.isIntraday ? 60 : 14400) { return }
-            }
-        } else {
-            rejected = load; error = MarketHistoryError.rangeTooLarge.localizedDescription
+        do { try load.validate() } catch {
+            rejected = load; self.error = error.localizedDescription
             return
+        }
+        if let previous = cached[sourcePeriod], previous.covers(load) {
+            publish(previous, for: load)
+            if !force, Date().timeIntervalSince(previous.history.fetchedAt) < (sourcePeriod.isIntraday ? 60 : 14400) { return }
         }
         guard !loading else { return }
         let allowedAt = max(nextRequestAt, (lastAttempt[load] ?? .distantPast).addingTimeInterval(60),
                             force ? (lastPeriodAttempt[sourcePeriod] ?? .distantPast).addingTimeInterval(60) : .distantPast)
         guard Date() >= allowedAt else {
-            error = "行情暂时使用缓存；\(max(1, Int(allowedAt.timeIntervalSinceNow.rounded(.up)))) 秒后可手动刷新。"
+            let wait = max(1, Int(allowedAt.timeIntervalSinceNow.rounded(.up)))
+            error = matchingHistory(for: load) == nil
+                ? "所选范围行情暂不可请求；\(wait) 秒后可手动刷新。"
+                : "行情暂时使用缓存；\(wait) 秒后可手动刷新。"
             return
         }
         if lastAttempt.count > 48 { lastAttempt = lastAttempt.filter { Date().timeIntervalSince($0.value) < 60 } }
-        loading = true; error = history?.warning
+        loading = true; rejected = nil; error = matchingHistory(for: load)?.warning
         let previousAttempt = lastAttempt[load]
         let previousPeriodAttempt = lastPeriodAttempt[sourcePeriod]
         lastAttempt[load] = Date(); lastPeriodAttempt[sourcePeriod] = Date()
+        var retryRepeatedRequest = false
         do {
             activeLoad = load
-            let work = Task { [client] () throws -> (MarketHistory, BTCChartViewport) in
+            let work = Task { [client] () throws -> (MarketHistory, BTCChartViewport, Int?) in
                 let fetched: MarketHistory
                 let expected: BTCChartViewport
+                let nativeGranularity: Int?
                 if !sourcePeriod.isIntraday {
+                    nativeGranularity = nil
                     fetched = try await client.fetch(range: .all)
                     expected = BTCChartViewport(start: MarketRange.genesisDate, end: fetched.fetchedAt)
                 } else if sourcePeriod == .minute, window.start >= Date().addingTimeInterval(-7 * 86400 - 60), window.end >= Date().addingTimeInterval(-60), window.end <= Date() {
+                    nativeGranularity = 60
                     let start = Date().addingTimeInterval(-7 * 86400)
                     fetched = try await client.fetchMinutes()
                     expected = BTCChartViewport(start: min(window.start, Date(timeIntervalSince1970: floor(start.timeIntervalSince1970 / 60) * 60)), end: fetched.fetchedAt)
                 } else {
+                    nativeGranularity = try MarketHistoryClient.intradayPlan(period: sourcePeriod,
+                        from: window.start, through: window.end, now: Date()).granularity
                     fetched = try await client.fetchIntraday(period: sourcePeriod, from: window.start, through: window.end)
-                    expected = window
+                    // Preserve actual source boundaries in cache metadata;
+                    // plotting independently enforces the chosen cutoff.
+                    expected = BTCChartViewport(start: min(window.start, fetched.candles.first?.startDate ?? window.start),
+                                                end: max(window.end, fetched.candles.last?.closeDate ?? window.end))
                 }
                 try Task.checkCancellation()
-                return (fetched, expected)
+                return (fetched, expected, nativeGranularity)
             }
             fetchTask = work
-            let (fetched, expected) = try await withTaskCancellationHandler(operation: { try await work.value }, onCancel: { work.cancel() })
+            let (fetched, expected, nativeGranularity) = try await withTaskCancellationHandler(operation: { try await work.value }, onCancel: { work.cancel() })
             try Task.checkCancellation()
             let displayHistory: MarketHistory
             if sourcePeriod == .day, fetched.warning != nil, let previous = cached[.day] {
                 displayHistory = (try? MarketHistoryClient.combine(early: previous.history.candles, daily: fetched)) ?? fetched
             } else { displayHistory = fetched }
-            let record = BTCMarketCacheRecord(period: sourcePeriod, from: expected.start, through: expected.end, history: displayHistory)
+            let record = BTCMarketCacheRecord(period: sourcePeriod, from: expected.start, through: expected.end,
+                                              history: displayHistory, nativeGranularity: nativeGranularity)
             guard valid(record) else { throw MarketHistoryError.invalidResponse }
             cached[sourcePeriod] = record; rateLimitFailures = 0
             if let latest = requested, record.covers(latest) { publish(record, for: latest) }
@@ -163,6 +219,9 @@ private final class BTCChartModel: ObservableObject {
         } catch {
             if error is CancellationError || (error as? URLError)?.code == .cancelled {
                 lastAttempt[load] = previousAttempt; lastPeriodAttempt[sourcePeriod] = previousPeriodAttempt
+                // A → B → A can return to the original load while its first
+                // fetch is still cancelling. That newer A must not be lost.
+                retryRepeatedRequest = requested == load && requestRevision > revision
             } else {
                 if error as? MarketHistoryError == .httpStatus(429) {
                     rateLimitFailures += 1
@@ -174,7 +233,7 @@ private final class BTCChartModel: ObservableObject {
             }
         }
         fetchTask = nil; activeLoad = nil; loading = false
-        if let pending = requested, pending != load {
+        if let pending = requested, pending != load || retryRepeatedRequest {
             Task {
                 guard self.requested == pending else { return }
                 await self.load(period: pending.period, window: pending.window)
@@ -306,13 +365,13 @@ struct BTCReferenceSegment: Identifiable {
     }
 }
 
-private struct ChartEvent: Identifiable {
+struct ChartEvent: Identifiable {
     let entry: LedgerEntry
     let y: Double
     var id: UUID { entry.id }
 }
 
-private struct BTCPlotCacheKey: Equatable {
+struct BTCPlotCacheKey: Equatable {
     let historyRevision: Int
     let accounts: [Account]
     let entries: [LedgerEntry]
@@ -354,7 +413,7 @@ struct BTCChartAxis {
     }
 }
 
-private struct BTCPlotData {
+struct BTCPlotData {
     let id = UUID()
     let window: BTCChartViewport
     let period: MarketPeriod
@@ -370,7 +429,7 @@ private struct BTCPlotData {
 /// A small revision invalidates market data, and the complete account/entry
 /// values invalidate editing, deletion, and migration without inspecting count.
 @MainActor
-private final class BTCPlotCache: ObservableObject {
+final class BTCPlotCache: ObservableObject {
     private var key: BTCPlotCacheKey?
     private var cached: BTCPlotData?
     func data(history: MarketHistory, key incoming: BTCPlotCacheKey) -> BTCPlotData {
@@ -385,8 +444,8 @@ private final class BTCPlotCache: ObservableObject {
             history: history, from: incoming.window.start, through: incoming.window.end)) ?? []).map {
                 ChartEvent(entry: $0.entry, y: NSDecimalNumber(decimal: $0.markerPriceUSD).doubleValue)
             }
-        // Fit only the visible observations on an explicit time zoom/reset.
-        // Panning supplies a frozen priceWindow and therefore keeps its scale.
+        // Automatic pricing fits the observations after every time navigation.
+        // Only an explicitly adjusted priceWindow keeps its manual scale.
         let costsAndEvents = costs.map { NSDecimalNumber(decimal: $0.costUSD).doubleValue } + events.map(\.y)
         let highs = candles.map { NSDecimalNumber(decimal: $0.hasOHLC ? $0.high : $0.close).doubleValue } + costsAndEvents
         let lows = candles.map { NSDecimalNumber(decimal: $0.hasOHLC ? $0.low : $0.close).doubleValue } + costsAndEvents
@@ -412,7 +471,7 @@ private struct BTCPricePlot: View, Equatable {
             PointMark(x: .value("日期", data.window.start), y: .value("坐标", data.yDomain.lowerBound)).opacity(0)
             PointMark(x: .value("日期", data.window.end), y: .value("坐标", data.yDomain.upperBound)).opacity(0)
             ForEach(data.costs) { point in
-                LineMark(x: .value("日期", point.date), y: .value("综合成本", double(point.costUSD)), series: .value("成本分段", point.segment))
+                LineMark(x: .value("日期", point.date), y: .value("每 BTC 成本", double(point.costUSD)), series: .value("成本分段", point.segment))
                     .foregroundStyle(Color.orange).lineStyle(StrokeStyle(lineWidth: 2))
             }
             ForEach(data.events) { marker in eventMark(marker) }
@@ -437,13 +496,20 @@ private struct BTCPricePlot: View, Equatable {
         func y(_ value: Decimal) -> CGFloat { (data.yDomain.upperBound - double(value)) * yScale }
         var up = Path(), down = Path(), partialUp = Path(), partialDown = Path()
         for candle in data.candles where candle.hasOHLC {
+            let visibleStart = max(candle.startDate, data.window.start)
+            let visibleEnd = min(candle.closeDate, data.window.end)
+            guard visibleStart < visibleEnd else { continue }
+            let visibleInterval = visibleEnd.timeIntervalSince(visibleStart)
             let rising = candle.close >= candle.open
             var bar = Path()
-            let center = x(candle.centerDate)
+            // Coarse candles can be longer than the whole visible window.
+            // Position their genuine OHLC inside the visible overlap so the
+            // wick/body cannot both disappear beyond the clipping boundary.
+            let center = x(visibleStart.addingTimeInterval(visibleInterval / 2))
             bar.move(to: CGPoint(x: center, y: y(candle.high)))
             bar.addLine(to: CGPoint(x: center, y: y(candle.low)))
-            let left = x(candle.startDate.addingTimeInterval(candle.interval * 0.12))
-            let right = x(candle.closeDate.addingTimeInterval(-candle.interval * 0.12))
+            let left = x(visibleStart.addingTimeInterval(visibleInterval * 0.12))
+            let right = x(visibleEnd.addingTimeInterval(-visibleInterval * 0.12))
             let top = y(max(candle.open, candle.close)), bottom = y(min(candle.open, candle.close))
             bar.addRect(CGRect(x: left, y: top, width: max(0.5, right - left), height: max(0.7, bottom - top)))
             if candle.isComplete && candle.missingDays == 0 {
@@ -489,27 +555,47 @@ private struct BTCPricePlot: View, Equatable {
     }
 }
 
-/// Uses the same picker instances while placing details beside controls when
-/// space permits and below them on narrow windows.
-private struct BTCControlsLayout: Layout {
+/// Repositions the same controls and summary without recreating their state.
+private struct BTCChartHeaderLayout: Layout {
+    private struct Measurements {
+        let left: CGSize
+        let middle: CGSize
+        let right: CGSize
+        let horizontal: Bool
+        let sidesFit: Bool
+        let topHeight: CGFloat
+        var height: CGFloat { horizontal ? max(left.height, max(middle.height, right.height)) : topHeight + 8 + middle.height }
+    }
+    private func measure(width: CGFloat, subviews: Subviews) -> Measurements {
+        let leftWidth = min(180, width)
+        let rightWidth = min(width, max(176, subviews[2].sizeThatFits(.unspecified).width))
+        let middleWidth = width - leftWidth - rightWidth - 24
+        let horizontal = middleWidth >= 400
+        let left = subviews[0].sizeThatFits(ProposedViewSize(width: leftWidth, height: nil))
+        let middle = subviews[1].sizeThatFits(ProposedViewSize(width: horizontal ? middleWidth : width, height: nil))
+        let right = subviews[2].sizeThatFits(ProposedViewSize(width: rightWidth, height: nil))
+        let sidesFit = width >= leftWidth + rightWidth + 12
+        return Measurements(left: CGSize(width: leftWidth, height: left.height),
+                            middle: CGSize(width: horizontal ? middleWidth : width, height: middle.height),
+                            right: CGSize(width: rightWidth, height: right.height),
+                            horizontal: horizontal, sidesFit: sidesFit,
+                            topHeight: sidesFit ? max(left.height, right.height) : left.height + 8 + right.height)
+    }
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let width = proposal.width ?? 600
-        let left = subviews.first?.sizeThatFits(ProposedViewSize(width: 180, height: nil)) ?? .zero
-        guard subviews.count > 1 else { return CGSize(width: width, height: max(60, left.height)) }
-        let horizontal = width >= 520
-        let right = subviews[1].sizeThatFits(ProposedViewSize(width: horizontal ? width - 192 : width, height: nil))
-        return CGSize(width: width, height: horizontal ? max(60, max(left.height, right.height)) : left.height + 8 + right.height)
+        guard subviews.count == 3 else { return .zero }
+        return CGSize(width: width, height: measure(width: width, subviews: subviews).height)
     }
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        guard let first = subviews.first else { return }
-        first.place(at: bounds.origin, proposal: ProposedViewSize(width: 180, height: nil))
-        guard subviews.count > 1 else { return }
-        if bounds.width >= 520 {
-            subviews[1].place(at: CGPoint(x: bounds.minX + 192, y: bounds.minY), proposal: ProposedViewSize(width: bounds.width - 192, height: nil))
-        } else {
-            let leftHeight = first.sizeThatFits(ProposedViewSize(width: 180, height: nil)).height
-            subviews[1].place(at: CGPoint(x: bounds.minX, y: bounds.minY + leftHeight + 8), proposal: ProposedViewSize(width: bounds.width, height: nil))
-        }
+        guard subviews.count == 3 else { return }
+        let sizes = measure(width: bounds.width, subviews: subviews)
+        subviews[0].place(at: bounds.origin, proposal: ProposedViewSize(width: sizes.left.width, height: sizes.left.height))
+        subviews[1].place(at: CGPoint(x: sizes.horizontal ? bounds.minX + sizes.left.width + 12 : bounds.minX,
+                                     y: sizes.horizontal ? bounds.minY : bounds.minY + sizes.topHeight + 8),
+                          proposal: ProposedViewSize(width: sizes.middle.width, height: sizes.middle.height))
+        subviews[2].place(at: CGPoint(x: bounds.maxX - sizes.right.width,
+                                     y: sizes.horizontal || sizes.sidesFit ? bounds.minY : bounds.minY + sizes.left.height + 8),
+                          proposal: ProposedViewSize(width: sizes.right.width, height: sizes.right.height))
     }
 }
 
@@ -518,9 +604,18 @@ private enum BTCVisibleRange: Hashable {
     case custom
 }
 
+private struct BTCChartDetails {
+    /// Nil means the current ledger and the latest quote, independent of the viewport.
+    let date: Date?
+    let state: LedgerSnapshot?
+    let price: Decimal?
+    let caption: String
+    let totals: BTCDailyChartTotals?
+}
+
 struct BTCChartView: View {
     @EnvironmentObject private var store: AppStore
-    @StateObject private var model = BTCChartModel()
+    @StateObject private var model: BTCChartModel
     @StateObject private var plotCache = BTCPlotCache()
     @State private var range: MarketRange = .month
     @State private var period: MarketPeriod = .day
@@ -532,6 +627,7 @@ struct BTCChartView: View {
     @State private var customError: String?
     @State private var hoverDate: Date?
     @State private var selectedDate: Date?
+    @State private var inspectionActivity = UUID()
     @State private var viewport: BTCChartViewport?
     @State private var priceViewport: BTCPriceViewport?
     @State private var manualPriceScale = false
@@ -539,33 +635,34 @@ struct BTCChartView: View {
     @Binding var expandedChart: Bool
     private let costColor = Color.orange
 
+    init(expandedChart: Binding<Bool>, range: MarketRange = .month, period: MarketPeriod = .day,
+         today: Date = Date(), model: BTCChartModel? = nil) {
+        _expandedChart = expandedChart
+        _range = State(initialValue: range)
+        _period = State(initialValue: period)
+        _today = State(initialValue: today)
+        _model = StateObject(wrappedValue: model ?? BTCChartModel())
+    }
+
     private var minimumDuration: TimeInterval { period.nominalSeconds }
     private var lowerBound: Date { BTCChartViewport.genesis }
     private var desiredWindow: BTCChartViewport {
         viewport ?? (useCustomRange ? customWindow : nil) ?? BTCChartViewport(start: range.startDate(today: today), end: today)
     }
     private var desiredLoad: BTCChartLoad { BTCChartLoad(period: period, window: desiredWindow) }
-    private var loadTaskID: BTCChartLoad {
-        period.isIntraday ? desiredLoad : BTCChartLoad(period: .day, window: BTCChartViewport(start: .distantPast, end: .distantFuture))
-    }
-    private var window: BTCChartViewport {
-        model.rejected == desiredLoad ? model.displayedWindow ?? desiredWindow : desiredWindow
-    }
-    private var displayPeriod: MarketPeriod {
-        if model.rejected == desiredLoad, let history = model.history { return history.period.isIntraday ? history.period : .day }
-        return period
-    }
+    private var rangeTitle: String { useCustomRange ? "自选日期" : range.title }
+    private var loadTaskID: BTCChartLoad { desiredLoad }
+    private var window: BTCChartViewport { desiredWindow }
+    private var displayPeriod: MarketPeriod { period }
     private var matchingHistory: MarketHistory? {
-        guard let history = model.history else { return nil }
-        if model.rejected == desiredLoad { return history }
-        return period.isIntraday ? (history.period == period ? history : nil) : (!history.period.isIntraday ? history : nil)
+        model.matchingHistory(period: period, window: desiredWindow)
     }
     private var rangeSelection: Binding<BTCVisibleRange> {
         Binding(get: { useCustomRange ? .custom : .preset(range) }, set: { selection in
             switch selection {
             case .preset(let selected):
                 range = selected; useCustomRange = false
-                today = Date(); viewport = nil; resetPriceScale(); hoverDate = nil; selectedDate = nil
+                today = Date(); viewport = nil; resetPriceScale(); dismissDetails()
             case .custom:
                 draftFrom = (customWindow ?? window).start
                 draftThrough = (customWindow ?? window).end
@@ -573,19 +670,30 @@ struct BTCChartView: View {
             }
         })
     }
+    private var periodSelection: Binding<MarketPeriod> {
+        Binding(get: { period }, set: { selected in
+            guard selected != period else { return }
+            period = selected
+            today = Date(); viewport = nil; resetPriceScale(); dismissDetails()
+        })
+    }
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack { title; Spacer(); actionControls }
-            BTCControlsLayout {
-                controls.frame(width: 180, alignment: .leading)
-                if let history = matchingHistory, let selectedDate { historicalDetails(history, date: selectedDate) }
-            }
-            ViewThatFits(in: .horizontal) {
-                HStack { legend; Spacer(); zoomControls }
-                VStack(alignment: .leading, spacing: 8) { legend; zoomControls }
-            }
+        let details = chartDetails(matchingHistory)
+        return VStack(alignment: .leading, spacing: 8) {
+            BTCChartHeaderLayout {
+                VStack(alignment: .leading, spacing: 8) {
+                    title
+                    controls
+                }
+                summaryDetails(details)
+                VStack(alignment: .center, spacing: 8) {
+                    actionControls.frame(maxWidth: .infinity, alignment: .trailing)
+                    zoomControls
+                    legend
+                }
+            }.fixedSize(horizontal: false, vertical: true)
             if let history = matchingHistory {
-                marketChart(history)
+                marketChart(history, details: details)
                 sourceCaption(history)
                 if expandedChart {
                     Text("图内捏合缩放时间；右侧价格轴拖动或捏合缩放价格，双击复位。← / → 逐根移动。")
@@ -594,8 +702,8 @@ struct BTCChartView: View {
             } else {
                 VStack(spacing: 12) {
                     if model.loading { ProgressView() }
-                    Text(model.loading ? "正在读取 BTC 美元历史 K 线…" : "暂无 K 线行情")
-                    Text("联网成功后显示真实开、高、低、收价格。")
+                    Text(model.loading ? "正在读取 \(rangeTitle) · \(period.title) 美元行情…" : "\(rangeTitle) · \(period.title) 暂无可用行情")
+                    Text(model.rejected == desiredLoad ? "请按下方提示调整范围或周期；保留当前选择。" : "联网成功后显示所选范围和周期的真实行情。")
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, minHeight: 60, maxHeight: .infinity)
             }
@@ -603,7 +711,7 @@ struct BTCChartView: View {
                 Text(error).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(16)
+        .padding(14)
         .background(.background, in: RoundedRectangle(cornerRadius: 16))
         .task(id: loadTaskID) {
             if period.isIntraday {
@@ -612,15 +720,25 @@ struct BTCChartView: View {
             guard !Task.isCancelled else { return }
             await model.load(period: period, window: desiredWindow)
         }
-        .onChange(of: period) { old, new in
-            if new.isIntraday, !old.isIntraday, !useCustomRange { range = new.nominalSeconds >= 3600 ? .week : .day }
-            else if !new.isIntraday, old.isIntraday, !useCustomRange, range == .hour || range == .day { range = .month }
-            today = Date(); viewport = nil; resetPriceScale(); hoverDate = nil; selectedDate = nil
+        .task(id: inspectionActivity) {
+            guard selectedDate != nil else { return }
+            do { try await Task.sleep(for: .milliseconds(1200)) } catch { return }
+            guard !Task.isCancelled else { return }
+            dismissDetails()
         }
+        .onChange(of: model.historyRevision) { _, _ in
+            // A newly fetched live partial candle can end just after the time
+            // captured before the request. Follow its real observation time
+            // only for the latest preset; historical and panned windows stay.
+            guard !useCustomRange, viewport == nil, let history = matchingHistory else { return }
+            let observationTime = min(history.fetchedAt, Date())
+            if observationTime > today { today = observationTime }
+        }
+        .onDisappear { dismissDetails() }
     }
     private var title: some View { Text("BTC 美元 K 线").font(.headline) }
     private var controls: some View {
-        VStack(alignment: .leading, spacing: 8) { rangeControl; periodControl }
+        VStack(alignment: .leading, spacing: 5) { rangeControl; periodControl }
     }
     private var rangeControl: some View {
         HStack(spacing: 8) {
@@ -666,17 +784,16 @@ struct BTCChartView: View {
         guard from >= BTCChartViewport.genesis, from < through, through <= now else {
             customError = "请选择 2009-01-03 至现在之间、开始早于结束的日期。"; return
         }
-        if period.isIntraday, through.timeIntervalSince(from) / period.nominalSeconds > 16000 {
-            customError = MarketHistoryError.rangeTooLarge.localizedDescription; return
-        }
+        do { try BTCChartLoad(period: period, window: BTCChartViewport(start: from, end: through)).validate(now: now) }
+        catch { customError = error.localizedDescription; return }
         customWindow = BTCChartViewport(start: from, end: through); useCustomRange = true
-        today = now; viewport = nil; resetPriceScale(); hoverDate = nil; selectedDate = nil
+        today = now; viewport = nil; resetPriceScale(); dismissDetails()
         customDatesVisible = false; customError = nil
     }
     private var periodControl: some View {
         HStack(spacing: 8) {
             Text("K 线周期").fixedSize().frame(width: 60, alignment: .leading)
-            Picker("K 线周期", selection: $period) {
+            Picker("K 线周期", selection: periodSelection) {
                 ForEach(MarketPeriod.allCases, id: \.self) { Text($0.title).tag($0) }
             }.labelsHidden().pickerStyle(.menu).frame(width: 96)
         }
@@ -687,7 +804,7 @@ struct BTCChartView: View {
                 Image(systemName: expandedChart ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
             }.help(expandedChart ? "收起图幅" : "展开图幅").accessibilityLabel(expandedChart ? "收起图幅" : "展开图幅")
             Button {
-                resetPriceScale(); today = Date()
+                resetPriceScale(); today = Date(); dismissDetails()
                 Task { await model.load(period: period, window: desiredWindow, force: true) }
             } label: {
                 if model.loading { ProgressView().controlSize(.small) }
@@ -706,7 +823,7 @@ struct BTCChartView: View {
             Button { changeZoom(2) } label: { Image(systemName: "minus.magnifyingglass") }
                 .help("缩小时间范围，价格自动适配可见行情")
                 .accessibilityLabel("缩小 K 线")
-            Button("重置") { today = Date(); viewport = nil; resetPriceScale(); hoverDate = nil; selectedDate = nil }
+            Button("重置") { today = Date(); viewport = nil; resetPriceScale(); dismissDetails() }
                 .help("回到所选时间范围")
             Button { moveWindow(1) } label: { Image(systemName: "chevron.right") }
                 .disabled(window.end >= today).help("较近的时间")
@@ -719,30 +836,38 @@ struct BTCChartView: View {
         hoverDate = nil
         if let selectedDate, selectedDate < window.start || selectedDate > window.end { self.selectedDate = nil }
     }
-    private func freezePriceScale() {
-        if priceViewport == nil, let history = matchingHistory { priceViewport = BTCPriceViewport(domain: plotData(history).yDomain) }
-    }
+    private func adaptPriceScaleForTimeNavigation() { if !manualPriceScale { priceViewport = nil } }
     private func resetPriceScale() { manualPriceScale = false; priceViewport = nil }
-    private func moveWindow(_ direction: Double) {
-        freezePriceScale()
-        viewport = window.moving(direction, today: today, lowerBound: lowerBound)
+    private func inspect(_ date: Date) {
+        hoverDate = date; selectedDate = date
+        inspectionActivity = UUID()
+    }
+    private func dismissDetails() {
+        guard hoverDate != nil || selectedDate != nil else { return }
         hoverDate = nil; selectedDate = nil
+        inspectionActivity = UUID()
+    }
+    private func moveWindow(_ direction: Double) {
+        viewport = window.moving(direction, today: today, lowerBound: lowerBound)
+        adaptPriceScaleForTimeNavigation(); dismissDetails()
     }
     private func stepWindow(_ direction: Int) {
         let previous = window
         let moved = previous.stepping(direction, period: period, today: today, lowerBound: lowerBound)
         guard moved != previous else { return }
-        freezePriceScale()
+        adaptPriceScaleForTimeNavigation()
         viewport = moved; hoverDate = nil
         if let selectedDate {
             let stepped = BTCChartViewport.stepDate(selectedDate, direction: direction, period: period)
             self.selectedDate = min(moved.end, max(moved.start, stepped))
         } else { selectedDate = moved.start.addingTimeInterval(moved.duration / 2) }
+        inspectionActivity = UUID()
     }
     private var legend: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Label("市价", systemImage: "chart.bar.xaxis").foregroundStyle(.secondary)
-            Label("综合成本", systemImage: "minus").foregroundStyle(costColor)
+            Label("BTC 成本", systemImage: "minus").foregroundStyle(costColor)
+                .help("该时点累计实际花费 ÷ 该时点持有 BTC，单位美元/BTC。")
             Label("购买", systemImage: "circle.fill").foregroundStyle(.blue)
             Label("转移", systemImage: "diamond.fill").foregroundStyle(.purple)
         }.font(.caption)
@@ -752,12 +877,15 @@ struct BTCChartView: View {
             accounts: store.document.accounts, entries: store.document.entries, range: range, period: displayPeriod,
             window: window, priceWindow: priceViewport))
     }
-    private func marketChart(_ history: MarketHistory) -> some View {
+    private func marketChart(_ history: MarketHistory, details: BTCChartDetails) -> some View {
         let data = plotData(history)
         let snapshot = BTCChartInputSnapshot(timeWindow: data.window.start...data.window.end,
             priceDomain: data.yDomain, visibleOHLCCount: data.visibleOHLCCount,
             visibleOHLCDomain: data.visibleOHLCDomain,
-            manualPriceScale: manualPriceScale)
+            manualPriceScale: manualPriceScale, detailsDate: details.date,
+            detailsSats: details.state?.totalSats, detailsPriceUSD: details.price,
+            detailsInvestedUSD: details.state?.totalInvestedUSD,
+            period: data.period, visibleCandleCount: data.candles.count)
         return BTCPricePlot(data: data).equatable()
         .chartOverlay { proxy in
             GeometryReader { geometry in
@@ -769,12 +897,12 @@ struct BTCChartView: View {
                     }
                     BTCChartInput(
                         onHover: { point in
-                            guard let point, let date = proxy.value(atX: point.x, as: Date.self) else { hoverDate = nil; return }
-                            hoverDate = min(window.end, max(window.start, date)); selectedDate = hoverDate
+                            guard let point, let date = proxy.value(atX: point.x, as: Date.self) else { dismissDetails(); return }
+                            inspect(min(window.end, max(window.start, date)))
                         },
                         onPan: { delta in
-                            if priceViewport == nil { priceViewport = BTCPriceViewport(domain: data.yDomain) }
                             viewport = window.panning(points: delta, plotWidth: plot.width, today: today, lowerBound: lowerBound)
+                            adaptPriceScaleForTimeNavigation()
                             hoverDate = nil
                             if let selectedDate, selectedDate < window.start || selectedDate > window.end { self.selectedDate = nil }
                         },
@@ -786,7 +914,7 @@ struct BTCChartView: View {
                             if let selectedDate, selectedDate < window.start || selectedDate > window.end { self.selectedDate = nil }
                         },
                         onStep: { direction in stepWindow(direction) },
-                        onDismissDetails: { hoverDate = nil; selectedDate = nil },
+                        onDismissDetails: { dismissDetails() },
                         snapshot: snapshot
                     )
                     .frame(width: plot.width, height: plot.height)
@@ -817,49 +945,99 @@ struct BTCChartView: View {
                 }
             }
         }
-        .frame(minHeight: expandedChart ? 620 : 60, maxHeight: expandedChart ? 620 : .infinity)
+        .frame(minHeight: expandedChart ? 620 : 200, maxHeight: expandedChart ? 620 : .infinity)
+        .overlay {
+            if data.candles.isEmpty {
+                VStack(spacing: 6) {
+                    Text("所选时间窗暂无 \(displayPeriod.title) 行情").font(.headline)
+                    Text("最后可用记录：\(dateText(history.latestClose(asOf: window.end)?.closeDate))")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("请扩大时间范围，或选择更短的 K 线周期。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                .allowsHitTesting(false)
+            }
+        }
         .help("双指左右移动；图内捏合缩放时间；右侧价格轴拖动或捏合缩放价格、双击复位。点击图后 ← / → 逐根移动。")
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("BTC 美元 K 线、综合成本与购买转移事件。当前 \(displayPeriod.title)，\(data.candles.count) 根可见行情。移动鼠标后在周期选择旁查看历史状态。")
+        .accessibilityLabel("BTC 美元 K 线、每 BTC 成本与购买转移事件。当前 \(displayPeriod.title)，\(data.candles.count) 根可见行情。\(data.candles.isEmpty ? "所选时间窗暂无行情。" : "")摘要默认显示最新状态；移动鼠标查看历史，停下或移开后恢复最新。")
     }
     private func sourceCaption(_ history: MarketHistory) -> some View {
-        Text("\(displayPeriod.isIntraday ? dateText(window.start) : dayText(window.start)) — \(displayPeriod.isIntraday ? dateText(window.end) : dayText(window.end)) · \(displayPeriod.title) · 美元 · 获取 \(dateText(history.fetchedAt))")
-            .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            .help(history.source + "；灰线/灰点为参考收盘，缺失留空。")
-    }
-    private func historicalDetails(_ history: MarketHistory, date: Date) -> some View {
-        let state = try? LedgerEngine.calculate(accounts: store.document.accounts, entries: store.document.entries, asOf: date)
-        let candle = history.latestClose(asOf: date)
-        let price = candle?.close
-        let totals = BTCDailyChartTotals(entries: store.document.entries, through: date)
-        return VStack(alignment: .leading, spacing: 4) {
-            Text("截止 \(dateText(date)) · \(candle.map { "\($0.hasOHLC ? (history.period.isIntraday ? "美元行情" : "美元日行情") : "参考收盘（非 OHLC）") \(dateText($0.closeDate))\($0.isComplete ? "" : "（行情未完整）")" } ?? "暂无此前行情")")
-                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), spacing: 8, alignment: .leading)], alignment: .leading, spacing: 4) {
-                metricCell("BTC 市价", Display.money(price))
-                metricCell("综合成本", Display.money(state?.averageCostUSD))
-                metricCell("总持有 BTC", state.map { Display.btc($0.totalSats) } ?? "—")
-                metricCell("累计投入美元", Display.money(state?.totalInvestedUSD))
-                metricCell("累计损耗 BTC", state.map { Display.btc($0.totalLossSats) } ?? "—")
-                metricCell("盈亏金额", Display.money(price.flatMap { state?.profit(price: $0) }))
-                metricCell("盈亏率", Display.percent(price.flatMap { state?.profitRatio(price: $0) }))
+        let showsTime = displayPeriod.isIntraday || window.duration < 2 * 86400
+        return VStack(alignment: .leading, spacing: 3) {
+            Text("\(showsTime ? dateText(window.start) : dayText(window.start)) — \(showsTime ? dateText(window.end) : dayText(window.end)) · \(displayPeriod.title) · 美元 · 获取 \(dateText(history.fetchedAt))")
+            if window.duration < displayPeriod.nominalSeconds {
+                Text("仅显示与窗口重叠的 K 线；未完成周期只含已观测行情。")
             }
-            if totals.purchaseCount > 0 {
+        }
+        .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        .help(history.source + "；灰线/灰点为参考收盘，缺失留空。")
+    }
+    private func chartDetails(_ history: MarketHistory?) -> BTCChartDetails {
+        guard let date = selectedDate, let history else {
+            return BTCChartDetails(date: nil, state: store.snapshot, price: store.quote?.priceUSD,
+                caption: store.quote.map { "美元行情获取于 \(dateText($0.fetchedAt))" } ?? "暂无美元行情",
+                totals: nil)
+        }
+        let candle = history.latestClose(asOf: date)
+        let observation = candle.map {
+            "\($0.hasOHLC ? (history.period.isIntraday ? "美元行情" : "美元日行情") : "参考收盘") \(dateText($0.closeDate))\($0.isComplete ? "" : "（行情未完整）")"
+        } ?? "暂无此前行情"
+        return BTCChartDetails(date: date,
+            state: try? LedgerEngine.calculate(accounts: store.document.accounts, entries: store.document.entries, asOf: date),
+            price: candle?.close, caption: "截至 \(dateText(date)) · \(observation)",
+            totals: BTCDailyChartTotals(entries: store.document.entries, through: date))
+    }
+    private func summaryDetails(_ details: BTCChartDetails) -> some View {
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(details.date == nil ? "最新" : "历史")
+                    .font(.caption.weight(.semibold)).foregroundStyle(details.date == nil ? Color.blue : Color.orange)
+                Text(details.caption).font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1).help(details.caption)
+            }
+            ViewThatFits(in: .horizontal) {
+                summaryMetrics(details, columns: 4).frame(minWidth: 400)
+                summaryMetrics(details, columns: 2)
+            }
+            if let totals = details.totals, totals.purchaseCount > 0 {
                 Text("当天购买：\(Display.money(totals.investedUSD)) → \(btcText(totals.purchasedBTC)) BTC")
                     .font(.caption2).fixedSize(horizontal: false, vertical: true)
             }
-            if totals.transferCount > 0 {
+            if let totals = details.totals, totals.transferCount > 0 {
                 Text("当天转移：转出 \(btcText(totals.transferredBTC)) · 到账 \(btcText(totals.receivedBTC)) · 损耗 \(btcText(totals.lossBTC)) BTC")
                     .font(.caption2).fixedSize(horizontal: false, vertical: true)
             }
         }
         .monospacedDigit().frame(maxWidth: .infinity, alignment: .leading)
+        .help("移动鼠标查看历史状态；停下约 1 秒或移开图表后恢复最新数据。")
     }
-    private func metricCell(_ title: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.caption2).foregroundStyle(.secondary)
-            Text(value).font(.caption).monospacedDigit().fixedSize(horizontal: false, vertical: true)
-        }.frame(maxWidth: .infinity, alignment: .leading)
+    private func summaryMetrics(_ details: BTCChartDetails, columns: Int) -> some View {
+        let state = details.state
+        let price = details.price
+        let profit = price.flatMap { state?.profit(price: $0) }
+        let ratio = price.flatMap { state?.profitRatio(price: $0) }
+        return LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 88), spacing: 10, alignment: .leading), count: columns),
+                         alignment: .leading, spacing: 6) {
+            metricCell("BTC 市价", Display.money(price))
+            metricCell("总持有 BTC", state.map { Display.btc($0.totalSats) } ?? "—")
+            metricCell("总成本", Display.money(state?.totalInvestedUSD))
+                .help("截至该时点实际花费的总成本，按购买时的历史汇率折算美元。")
+            metricCell("当前市值", Display.money(price.flatMap { state?.value(price: $0) }))
+            metricCell("浮盈", Display.money(profit), tint: DashboardMetric.profitColor(profit))
+            metricCell("浮盈率", Display.percent(ratio), tint: DashboardMetric.profitColor(ratio))
+            metricCell("累计损耗 BTC", state.map { Display.btc($0.totalLossSats) } ?? "—")
+            metricCell("损耗占比", Display.percent(state?.lossRatio))
+                .help("累计损耗 BTC ÷ 当前总持有 BTC。")
+        }
+    }
+    private func metricCell(_ title: String, _ value: String, tint: Color = .primary) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 14, weight: .semibold)).foregroundStyle(tint)
+                .monospacedDigit().lineLimit(1).minimumScaleFactor(0.8)
+        }.frame(maxWidth: .infinity, alignment: .leading).accessibilityElement(children: .combine)
     }
     private func btcText(_ value: Decimal) -> String {
         let formatter = NumberFormatter()

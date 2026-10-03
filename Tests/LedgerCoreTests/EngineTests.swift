@@ -62,6 +62,14 @@ struct EngineTests {
         #expect(after.totalInvestedUSD == before.totalInvestedUSD)
         #expect(after.totalLossSats == 0)
     }
+    @Test func lossRatioUsesRemainingHoldingsAndCanExceedOneHundredPercent() throws {
+        let partialLoss = try compute([buy(1_000_000, 500), transfer(1_000_000, 800_000)])
+        #expect(partialLoss.lossRatio == decimal("0.25"))
+        let heavyLoss = try compute([buy(1_000_000, 500), transfer(1_000_000, 250_000)])
+        #expect(heavyLoss.lossRatio == 3)
+        let noLoss = try compute([buy(1_000_000, 500)])
+        #expect(noLoss.lossRatio == 0)
+    }
     @Test func marketValueProfitAndRatioUseTotalInvestment() throws {
         let result = try compute([buy(10_000_000, 10_100), transfer(1_000_000, 990_000)])
         #expect(result.value(price: 120_000) == 11_988)
@@ -122,12 +130,14 @@ struct EngineTests {
         #expect(result.totalLossSats == 100_000)
         #expect(result.totalInvestedUSD == 500)
         #expect(result.averageCostUSD == nil)
+        #expect(result.lossRatio == nil)
         #expect(result.profit(price: 600_000) == -500)
         #expect(result.profitRatio(price: 600_000) == -1)
     }
     @Test func emptyRatiosAreUndefined() throws {
         let result = try compute([])
         #expect(result.averageCostUSD == nil)
+        #expect(result.lossRatio == nil)
         #expect(result.profitRatio(price: 600_000) == nil)
         #expect(result.value(price: 600_000) == 0)
     }

@@ -328,8 +328,9 @@ public struct MarketHistoryClient: Sendable {
     }
 
     /// Fetch the selected historical window using Coinbase's largest native
-    /// interval that divides the requested period. All limits are checked
-    /// before requests; the user's period and dates are never silently changed.
+    /// interval that divides the requested period and fits inside the window.
+    /// All limits are checked before requests; the user's period and dates are
+    /// never silently changed.
     public func fetchIntraday(period: MarketPeriod, from start: Date, through end: Date) async throws -> MarketHistory {
         let fetchedAt = Date()
         let plan = try Self.intradayPlan(period: period, from: start, through: end, now: fetchedAt)
@@ -531,14 +532,19 @@ extension MarketHistoryClient {
         let start: Date
         let end: Date
     }
-    struct IntradayPlan: Equatable, Sendable {
-        let start: Date
-        let end: Date
-        let granularity: Int
-        var nativeCount: Int { Int(end.timeIntervalSince(start)) / granularity }
+    public struct IntradayPlan: Equatable, Sendable {
+        public let start: Date
+        public let end: Date
+        public let granularity: Int
+        public var nativeCount: Int { Int(end.timeIntervalSince(start)) / granularity }
     }
-    static func nativeGranularity(period: MarketPeriod) -> Int {
-        [60, 300, 900, 3600, 21_600].last { Int(period.nominalSeconds) % $0 == 0 }!
+    /// A narrow viewport needs source observations inside that window, even
+    /// when its selected K period is longer. Finer completed source bars can
+    /// form a genuine ongoing aggregate without inventing a native candle.
+    static func nativeGranularity(period: MarketPeriod, windowDuration: TimeInterval = .infinity) -> Int {
+        [60, 300, 900, 3600, 21_600].last {
+            Int(period.nominalSeconds) % $0 == 0 && Double($0) <= windowDuration
+        } ?? 60
     }
     static func nativePeriod(granularity: Int) -> MarketPeriod {
         switch granularity {
@@ -549,16 +555,17 @@ extension MarketHistoryClient {
         default: .hour6
         }
     }
-    static func intradayPlan(period: MarketPeriod, from start: Date, through end: Date, now: Date) throws -> IntradayPlan {
+    public static func intradayPlan(period: MarketPeriod, from start: Date, through end: Date, now: Date) throws -> IntradayPlan {
         guard period.isIntraday, start.timeIntervalSince1970.isFinite, end.timeIntervalSince1970.isFinite,
               now.timeIntervalSince1970.isFinite, start >= MarketRange.genesisDate,
               start < end, end <= now else { throw MarketHistoryError.invalidRange }
-        let granularity = nativeGranularity(period: period)
+        let granularity = nativeGranularity(period: period, windowDuration: end.timeIntervalSince(start))
         let first = period.bucket(containing: start).start
-        let endBucket = period.bucket(containing: end)
-        let alignedEnd = end == endBucket.start ? end : endBucket.end
-        let completedEnd = min(alignedEnd, Date(timeIntervalSince1970:
-            floor(now.timeIntervalSince1970 / Double(granularity)) * Double(granularity)))
+        // Only source bars closed by the selected cutoff may contribute.
+        // Rounding a historical end up to the output period's boundary would
+        // borrow later prices and leave no partial bar after viewport filtering.
+        let completedEnd = Date(timeIntervalSince1970:
+            floor(min(end, now).timeIntervalSince1970 / Double(granularity)) * Double(granularity))
         guard completedEnd > first else { throw MarketHistoryError.emptyHistory }
         let outputCount = ceil(completedEnd.timeIntervalSince(first) / period.nominalSeconds)
         let nativeCount = completedEnd.timeIntervalSince(first) / Double(granularity)

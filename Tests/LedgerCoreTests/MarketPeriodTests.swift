@@ -99,10 +99,55 @@ private func periodBars(from start: Date, count: Int, seconds: TimeInterval) -> 
     let now = periodDate("2026-10-02T00:00:00Z")
     let plan = try MarketHistoryClient.intradayPlan(period: .hour2, from: start, through: end, now: now)
     #expect(plan.start == periodDate("2015-01-01T00:00:00Z"))
-    #expect(plan.end == periodDate("2015-01-02T10:00:00Z"))
-    #expect(plan.granularity == 3600 && plan.nativeCount == 34)
+    #expect(plan.end == periodDate("2015-01-02T08:00:00Z"))
+    #expect(plan.end <= end)
+    #expect(plan.granularity == 3600 && plan.nativeCount == 32)
     let pages = MarketHistoryClient.coinbasePages(from: plan.start, through: plan.end, granularity: plan.granularity)
     #expect(pages.count == 1 && pages.first?.end == plan.end)
+}
+
+@Test func shortViewportWithCoarseIntradayPeriodUsesRealFinerSourceObservations() throws {
+    let now = periodDate("2026-10-02T08:15:00Z")
+    let start = now.addingTimeInterval(-3600)
+    for period in [MarketPeriod.hour6, .hour12] {
+        let plan = try MarketHistoryClient.intradayPlan(period: period, from: start, through: now, now: now)
+        #expect(plan.granularity == 3600)
+        #expect(plan.end == periodDate("2026-10-02T08:00:00Z"))
+        #expect(plan.end >= start && plan.end <= now)
+        let bars = periodBars(from: plan.start, count: plan.nativeCount, seconds: Double(plan.granularity))
+        let source = MarketHistory(range: .hour, period: .hour, fetchedAt: now, candles: bars)
+        let aggregated = source.aggregatedCandles(period: period, through: plan.end)
+        let history = MarketHistory(range: .hour, period: period, fetchedAt: now, candles: aggregated)
+        let observed = try #require(history.aggregatedCandles(period: period, from: start, through: now).last)
+        #expect(observed.hasOHLC && !observed.isComplete)
+        #expect(observed.closeDate == plan.end && observed.closeDate >= start && observed.closeDate <= now)
+        #expect(observed.close == bars.last?.close)
+    }
+    for period in MarketPeriod.allCases where period.isIntraday {
+        let plan = try MarketHistoryClient.intradayPlan(period: period, from: start, through: now, now: now)
+        #expect(Double(plan.granularity) <= now.timeIntervalSince(start))
+        #expect(Int(period.nominalSeconds) % plan.granularity == 0)
+        #expect(plan.end >= start && plan.end <= now)
+    }
+    #expect(try MarketHistoryClient.intradayPlan(period: .hour12,
+        from: now.addingTimeInterval(-86400), through: now, now: now).granularity == 21600)
+}
+
+@Test func historicalShortCoarsePeriodStillExcludesUnobservedFutureClose() throws {
+    let now = periodDate("2026-10-02T08:15:00Z")
+    let end = periodDate("2015-01-01T08:15:00Z")
+    let start = end.addingTimeInterval(-3600)
+    let plan = try MarketHistoryClient.intradayPlan(period: .hour12, from: start, through: end, now: now)
+    #expect(plan.granularity == 3600 && plan.end == periodDate("2015-01-01T08:00:00Z"))
+    let bars = periodBars(from: plan.start, count: plan.nativeCount, seconds: 3600)
+    let source = MarketHistory(range: .hour, period: .hour, fetchedAt: now, candles: bars)
+    let aggregated = source.aggregatedCandles(period: .hour12, through: plan.end)
+    let history = MarketHistory(range: .hour, period: .hour12, fetchedAt: now, candles: aggregated)
+    let observed = try #require(history.aggregatedCandles(period: .hour12, from: start, through: end).last)
+    #expect(observed.closeDate == periodDate("2015-01-01T08:00:00Z"))
+    #expect(observed.closeDate <= end && !observed.isComplete && observed.hasOHLC)
+    #expect(observed.close == bars[7].close)
+    #expect(history.latestClose(asOf: observed.closeDate.addingTimeInterval(-1)) == nil)
 }
 
 @Test func intradayOutputAndNativeLimitsAreExplicitBeforeAnyRequests() throws {
@@ -184,6 +229,10 @@ private final class IntradayGapProtocol: IntradaySourceProtocol, @unchecked Send
     override class var log: IntradayRequestLog { recorded }
     override class var hasGap: Bool { true }
 }
+private final class IntradayShortProtocol: IntradaySourceProtocol, @unchecked Sendable {
+    static let recorded = IntradayRequestLog()
+    override class var log: IntradayRequestLog { recorded }
+}
 private func intradaySession(_ protocolClass: AnyClass) -> URLSession {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [protocolClass]
@@ -195,11 +244,34 @@ private func intradaySession(_ protocolClass: AnyClass) -> URLSession {
     defer { session.invalidateAndCancel() }
     let history = try await MarketHistoryClient(session: session).fetchIntraday(period: .hour2,
         from: periodDate("2015-01-01T00:07:00Z"), through: periodDate("2015-01-02T08:03:00Z"))
-    #expect(history.period == .hour2 && history.candles.count == 17)
+    #expect(history.period == .hour2 && history.candles.count == 16)
     #expect(history.candles.allSatisfy { $0.isComplete && $0.hasOHLC && $0.interval == 7200 && $0.close == 11 })
     #expect(history.candles.first?.startDate == periodDate("2015-01-01T00:00:00Z"))
     #expect(history.warning == nil && history.source.contains("美元") && !history.source.contains("ECB"))
     #expect(IntradayHourProtocol.recorded.requests.count == 1)
+}
+
+@Test func historicalShortWindowFetchesPartialCoarsePeriodBeforeExactCutoff() async throws {
+    let session = intradaySession(IntradayShortProtocol.self)
+    defer { session.invalidateAndCancel() }
+    let start = periodDate("2015-01-01T07:15:00Z")
+    let end = periodDate("2015-01-01T08:15:00Z")
+    for period in [MarketPeriod.hour6, .hour12] {
+        let history = try await MarketHistoryClient(session: session).fetchIntraday(period: period, from: start, through: end)
+        let visible = history.aggregatedCandles(period: period, from: start, through: end)
+        let candle = try #require(visible.last)
+        #expect(history.period == period && visible.count == 1)
+        #expect(candle.hasOHLC && !candle.isComplete)
+        #expect(candle.closeDate == periodDate("2015-01-01T08:00:00Z"))
+        #expect(candle.closeDate >= start && candle.closeDate <= end)
+        #expect(history.warning == nil)
+    }
+    #expect(IntradayShortProtocol.recorded.requests.count == 2)
+    #expect(IntradayShortProtocol.recorded.requests.allSatisfy { request in
+        URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.queryItems!.contains {
+            $0.name == "granularity" && $0.value == "3600"
+        }
+    })
 }
 
 @Test func customThreeMinuteHistoryPagesAreHalfOpenAndNoBoundaryIsDuplicated() async throws {

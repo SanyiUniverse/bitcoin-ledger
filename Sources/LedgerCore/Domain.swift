@@ -223,6 +223,11 @@ public struct LedgerSnapshot: Equatable, Sendable {
         guard totalSats > 0, let totalInvestedUSD else { return nil }
         return Amounts.rounded(totalInvestedUSD / Amounts.btc(totalSats))
     }
+    /// Loss relative to BTC still held; the display multiplies by 100.
+    public var lossRatio: Decimal? {
+        guard totalSats > 0 else { return nil }
+        return Amounts.rounded(Decimal(totalLossSats) / Decimal(totalSats))
+    }
     public func value(price: Decimal) -> Decimal { Amounts.rounded(Amounts.btc(totalSats) * price) }
     public func profit(price: Decimal) -> Decimal? {
         totalInvestedUSD.map { value(price: price) - $0 }

@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import LedgerCore
 
 /// NSEvent delivers a delta for each magnify event, not a gesture-total scale.
 enum BTCChartInputMath {
@@ -25,6 +26,12 @@ struct BTCChartInputSnapshot: Equatable {
     let visibleOHLCCount: Int
     let visibleOHLCDomain: ClosedRange<Double>?
     let manualPriceScale: Bool
+    var detailsDate: Date? = nil
+    var detailsSats: Int64? = nil
+    var detailsPriceUSD: Decimal? = nil
+    var detailsInvestedUSD: Decimal? = nil
+    var period: MarketPeriod = .day
+    var visibleCandleCount: Int = 0
 }
 
 /// A plot-local responder: vertical scrolling continues to the surrounding

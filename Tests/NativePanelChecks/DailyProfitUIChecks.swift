@@ -218,7 +218,7 @@ extension PanelChecks {
         if pressDailyRow(missing.date, in: window) {
             record(plot.snapshot?.detailsDate == missing.date && plot.snapshot!.timeWindow.contains(missing.date)
                 && abs(timeSpan(plot.snapshot!) - timeSpan(narrow)) < 0.01,
-                   "\(label): pressing the already selected daily row reveals its blue line while preserving zoom width")
+                   "\(label): pressing the already selected daily row reveals its blue-gray line while preserving zoom width")
             try snapshot(window, name: label + "-row-revealed")
         } else {
             report.append("SCOPE \(label): pure SwiftUI daily row button cannot be pressed in this hidden window; shared Binding tests cover date reveal and the installed app verifies single/double-click actions.")
@@ -310,7 +310,7 @@ extension PanelChecks {
         probe.selectedDate = missing.date; settle()
         record(plot.snapshot?.detailsDate == missing.date && plot.snapshot?.detailsPriceUSD == nil
             && plot.snapshot!.timeWindow.contains(missing.date) && fittedProfit(plot.snapshot, rows: rows),
-               "shared selection reveals a missing record's blue rule and original accounting detail across its gap")
+               "shared selection reveals a missing record's blue-gray rule and original accounting detail across its gap")
         let visible = rows.filter { plot.snapshot!.timeWindow.contains($0.date) && $0.profitUSD != nil }
         if let hoverRow = visible.first, let clickRow = visible.last {
             let current = plot.snapshot!

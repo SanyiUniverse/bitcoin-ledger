@@ -430,7 +430,8 @@ struct DailyProfitChart: View {
                             .symbolSize(data.symbolSize)
                     }
                     if let selected {
-                        RuleMark(x: .value("查看日期", selected.date)).foregroundStyle(Color.blue)
+                        RuleMark(x: .value("查看日期", selected.date))
+                            .foregroundStyle(Color(red: 129.0 / 255, green: 148.0 / 255, blue: 166.0 / 255))
                             .lineStyle(StrokeStyle(lineWidth: 1.5))
                     }
                 }

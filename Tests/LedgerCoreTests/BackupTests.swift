@@ -30,8 +30,9 @@ private func backupFixture() -> BackupDocument {
     #expect(try BackupCodec.decode(BackupCodec.encode(document)) == document)
 }
 @Test func backupRejectsFutureVersionBeforeReadingFutureBody() {
-    #expect(throws: BackupError.unsupportedSchema(6)) {
-        try BackupCodec.decode(Data(#"{"schemaVersion":6,"baseCurrency":{"future":"body"}}"#.utf8))
+    let futureVersion = BackupDocument.currentSchemaVersion + 1
+    #expect(throws: BackupError.unsupportedSchema(futureVersion)) {
+        try BackupCodec.decode(Data("{\"schemaVersion\":\(futureVersion),\"baseCurrency\":{\"future\":\"body\"}}".utf8))
     }
 }
 @Test func backupRejectsOversizeAndMalformedFiles() {
@@ -82,4 +83,46 @@ private func backupFixture() -> BackupDocument {
     #expect(csv.contains("\"'=HYPERLINK(\"\"example\"\")\""))
     #expect(csv.contains("\"'@SUM(1,2)\r\n\"\"test\"\"\""))
     #expect(try BackupCodec.decode(BackupCodec.encode(document)) == document)
+}
+
+private func csvFormattingFixture() -> BackupDocument {
+    let parser = ISO8601DateFormatter()
+    parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let date = parser.date(from: "2026-10-01T04:00:37.125Z")!
+    var accounts = Account.defaults
+    accounts[0].name = "=HYPERLINK(\"example\")"
+    let entry = syntheticEntry(id: UUID(uuidString: "20000000-0000-0000-0000-000000000001")!,
+        date: date, kind: .buy, toAccountID: accounts[0].id, receivedSats: 100_000_000,
+        amountCNY: 100, note: "@SUM(1,2)\r\n\"test\"")
+    let price = DailyNoonObservation(targetAt: date, priceUSD: 200, fetchedAt: date.addingTimeInterval(30))
+    return BackupDocument(exportedAt: date, accounts: accounts, entries: [entry], dailyNoonObservations: [price])
+}
+
+@Test func transactionCSVFormattingRemainsByteExactWithFractionalTimesAndEscapedText() throws {
+    let expected = "\u{FEFF}"
+        + "id,date_utc,sequence,kind,from_account_id,from_account_name,to_account_id,to_account_name,amount_sats,amount_btc,received_sats,received_btc,amount_cny,amount_usd,cny_per_usd,fx_date_utc,fx_source,loss_sats,loss_btc,note\r\n"
+        + "20000000-0000-0000-0000-000000000001,2026-10-01T04:00:37.125Z,0,buy,,,10000000-0000-0000-0000-000000000001,\"'=HYPERLINK(\"\"example\"\")\",100000000,1,100000000,1,100,100,1,2026-09-30T00:00:00.000Z,合成测试汇率,0,0,\"'@SUM(1,2)\r\n\"\"test\"\"\"\r\n"
+    #expect(try BackupCodec.csv(csvFormattingFixture()) == Data(expected.utf8))
+}
+
+@Test func dailyCSVFormattingRemainsByteExactWithFractionalTimesAndMissingPrice() throws {
+    let document = csvFormattingFixture()
+    let today = document.entries[0].date
+    let expected = "\u{FEFF}"
+        + "date_shanghai,settlement_utc,amount_sats,amount_btc,cost_usd,market_value_usd,profit_usd,profit_ratio,price_usd,status,source,fetched_at_utc\r\n"
+        + "2026-10-01,2026-10-01T04:00:37.125Z,100000000,1,100,200,100,1,200,available,Coinbase · BTC-USD 结算前最近完整分钟收盘（美元）,2026-10-01T04:01:07.125Z\r\n"
+        + "2026-10-02,2026-10-02T04:00:37.125Z,100000000,1,100,,,,,pendingPrice,,\r\n"
+    #expect(try BackupCodec.dailyProfitCSV(document, now: today.addingTimeInterval(86_400)) == Data(expected.utf8))
+}
+
+@Test func decodedSourceVersionMatchesValidatedOriginalBeforeNormalization() throws {
+    let document = csvFormattingFixture()
+    let current = try BackupCodec.decodeWithSourceVersion(BackupCodec.encode(document))
+    #expect(current.sourceVersion == BackupDocument.currentSchemaVersion && current.document == document)
+    let legacy = try BackupCodec.decodeWithSourceVersion(legacyV1Bytes())
+    #expect(legacy.sourceVersion == 1 && legacy.document.schemaVersion == BackupDocument.currentSchemaVersion)
+    var object = try #require(JSONSerialization.jsonObject(with: BackupCodec.encode(BackupDocument())) as? [String: Any])
+    object["schemaVersion"] = 6
+    let previous = try BackupCodec.decodeWithSourceVersion(JSONSerialization.data(withJSONObject: object))
+    #expect(previous.sourceVersion == 6 && previous.document.schemaVersion == BackupDocument.currentSchemaVersion)
 }

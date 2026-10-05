@@ -2,20 +2,72 @@ import SwiftUI
 import LedgerCore
 
 enum Page: String, CaseIterable, Identifiable {
-    case dashboard = "总览", history = "历史记录"
+    case dashboard = "总览", history = "历史记录", dailyProfit = "每日盈亏"
+    static let storageKey = "sidebar.pageOrder.v1"
     var id: String { rawValue }
-    var icon: String { self == .dashboard ? "square.grid.2x2" : "clock" }
+    var icon: String {
+        switch self {
+        case .dashboard: "square.grid.2x2"
+        case .history: "clock"
+        case .dailyProfit: "chart.xyaxis.line"
+        }
+    }
+    static func ordered(from raw: String) -> [Self] {
+        var seen = Set<Self>()
+        let stored = raw.split(separator: ",").compactMap { Self(rawValue: String($0)) }
+        return (stored + allCases).filter { seen.insert($0).inserted }
+    }
+    static func reordered(_ raw: String, fromOffsets: IndexSet, toOffset: Int) -> String {
+        var order = ordered(from: raw)
+        guard !fromOffsets.isEmpty, fromOffsets.allSatisfy({ order.indices.contains($0) }),
+              (0...order.count).contains(toOffset) else { return order.map(\.rawValue).joined(separator: ",") }
+        order.move(fromOffsets: fromOffsets, toOffset: toOffset)
+        return order.map(\.rawValue).joined(separator: ",")
+    }
+    static func reordered(_ raw: String, moving source: Self, to destination: Int) -> String {
+        let order = ordered(from: raw)
+        guard let index = order.firstIndex(of: source), order.indices.contains(destination) else {
+            return order.map(\.rawValue).joined(separator: ",")
+        }
+        return reordered(raw, fromOffsets: IndexSet(integer: index),
+            toOffset: destination > index ? destination + 1 : destination)
+    }
 }
 
 struct ContentView: View {
     @EnvironmentObject private var store: AppStore
-    @State private var page: Page? = .dashboard
+    @State private var page: Page?
+    @State private var didSelectStartupPage = false
     @State private var panel: LedgerPanel?
+    @AppStorage(Page.storageKey) private var pageOrder = ""
     @FocusState private var navigationFocused: Bool
+    private let initialPage: Page?
+
+    init(initialPage: Page? = nil) {
+        self.initialPage = initialPage
+        _page = State(initialValue: initialPage)
+    }
+    private var orderedPages: [Page] { Page.ordered(from: pageOrder) }
+    private var currentPage: Page { page ?? initialPage ?? orderedPages.first ?? .dashboard }
 
     var body: some View {
         NavigationSplitView {
-            List(Page.allCases, selection: $page) { page in Label(page.rawValue, systemImage: page.icon).tag(page) }
+            List(selection: $page) {
+                ForEach(orderedPages) { sidebarPage in
+                    Label(sidebarPage.rawValue, systemImage: sidebarPage.icon).tag(sidebarPage)
+                        .accessibilityIdentifier("sidebar.page.\(sidebarPage.id)")
+                        .help("拖动调整顺序；启动时打开排在最上方的页面。")
+                        .contextMenu {
+                            let index = orderedPages.firstIndex(of: sidebarPage) ?? 0
+                            Button("上移") { movePage(sidebarPage, to: index - 1) }.disabled(index == 0)
+                            Button("下移") { movePage(sidebarPage, to: index + 1) }.disabled(index == orderedPages.count - 1)
+                            Button("移到顶部") { movePage(sidebarPage, to: 0) }.disabled(index == 0)
+                        }
+                }
+                .onMove { offsets, destination in
+                    pageOrder = Page.reordered(pageOrder, fromOffsets: offsets, toOffset: destination)
+                }
+            }
                 .focused($navigationFocused)
                 .navigationSplitViewColumnWidth(min: 160, ideal: 185, max: 220)
                 .safeAreaInset(edge: .bottom) {
@@ -31,13 +83,15 @@ struct ContentView: View {
                         Label("账本需要恢复", systemImage: "externaldrive.badge.exclamationmark")
                     } description: { Text(error) } actions: { Button("从备份恢复…") { store.importJSON() } }
                 } else {
-                    switch page ?? .dashboard {
+                    switch currentPage {
                     case .dashboard: DashboardView(onAdd: { present(.entry($0, nil)) })
                     case .history: HistoryView(entries: store.entries, onEntry: { present(.detail($0)) })
+                        .accessibilityIdentifier("history.page")
+                    case .dailyProfit: DailyProfitView()
                     }
                 }
             }
-            .navigationTitle((page ?? .dashboard).rawValue)
+            .navigationTitle(currentPage.rawValue)
             .toolbar {
                 ToolbarItemGroup {
                     Button { present(.rules) } label: { Image(systemName: "info.circle") }.help("计算规则").disabled(panel != nil)
@@ -61,10 +115,22 @@ struct ContentView: View {
                     .environmentObject(store)
             }
         }
+        .onAppear {
+            // AppStorage resolves the host's environment here. Tests and other
+            // windows can supply isolated preferences without reading .standard.
+            guard !didSelectStartupPage else { return }
+            didSelectStartupPage = true
+            pageOrder = orderedPages.map(\.rawValue).joined(separator: ",")
+            page = initialPage ?? orderedPages.first
+        }
         .onDisappear { store.isPresentingPanel = false }
         .alert("Bitcoin Ledger", isPresented: Binding(get: { store.message != nil }, set: { if !$0 { store.message = nil } })) {
             Button("好", role: .cancel) { store.message = nil }
         } message: { Text(store.message ?? "") }
+    }
+
+    private func movePage(_ source: Page, to destination: Int) {
+        pageOrder = Page.reordered(pageOrder, moving: source, to: destination)
     }
 
     private func present(_ destination: LedgerPanel.Destination) {

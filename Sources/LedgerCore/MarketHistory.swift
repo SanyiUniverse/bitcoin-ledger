@@ -389,7 +389,12 @@ public struct MarketHistoryClient: Sendable {
         let (data, response) = try await session.data(for: request)
         try Task.checkCancellation()
         guard let http = response as? HTTPURLResponse else { throw MarketHistoryError.invalidResponse }
-        guard (200...299).contains(http.statusCode) else { throw MarketHistoryError.httpStatus(http.statusCode) }
+        guard (200...299).contains(http.statusCode) else {
+            if let retryAfter = HTTPRetryError.retryAfter(http.value(forHTTPHeaderField: "Retry-After"), now: Date()) {
+                throw HTTPRetryError(statusCode: http.statusCode, retryAfter: retryAfter)
+            }
+            throw MarketHistoryError.httpStatus(http.statusCode)
+        }
         guard data.count <= maximumBytes else { throw MarketHistoryError.invalidResponse }
         return data
     }
@@ -717,12 +722,19 @@ public struct LedgerChartEvent: Equatable, Identifiable, Sendable {
 public enum LedgerChartHistory {
     public static func events(accounts: [Account], entries: [LedgerEntry], history: MarketHistory,
                               from start: Date, through end: Date) throws -> [LedgerChartEvent] {
-        guard let fallback = history.candles.first?.low else { return [] }
+        guard !history.candles.isEmpty else { return [] }
         let snapshots = try LedgerEngine.history(accounts: accounts, entries: entries)
+        return events(entries: entries, ledgerHistory: snapshots, history: history, from: start, through: end)
+    }
+    /// Reuses the ordered, validated replay for these entries. A plot's cost
+    /// and event overlays can share one LedgerEngine.history calculation.
+    public static func events(entries: [LedgerEntry], ledgerHistory: [LedgerHistoryPoint], history: MarketHistory,
+                              from start: Date, through end: Date) -> [LedgerChartEvent] {
+        guard let fallback = history.candles.first?.low else { return [] }
         let byID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
         var priorCost: Decimal?
         var result: [LedgerChartEvent] = []
-        for point in snapshots {
+        for point in ledgerHistory {
             defer { priorCost = point.snapshot.averageCostUSD }
             guard point.date >= start, point.date <= end, let entry = byID[point.entryID] else { continue }
             let position = point.snapshot.averageCostUSD ?? priorCost
@@ -736,9 +748,15 @@ public enum LedgerChartHistory {
     /// A zero holding splits the line instead of drawing across an undefined cost.
     public static func costPoints(accounts: [Account], entries: [LedgerEntry], from start: Date, through end: Date) throws -> [CostChartPoint] {
         guard start <= end else { return [] }
-        var prior = try LedgerEngine.calculate(accounts: accounts, entries: entries, asOf: start)
-        let events = try LedgerEngine.history(accounts: accounts, entries: entries)
-            .filter { $0.date > start && $0.date <= end }
+        let snapshots = try LedgerEngine.history(accounts: accounts, entries: entries)
+        return costPoints(ledgerHistory: snapshots, from: start, through: end)
+    }
+    /// The replay includes same-instant events in ledger order. The start
+    /// state includes all events at the cutoff; later events form stair steps.
+    public static func costPoints(ledgerHistory: [LedgerHistoryPoint], from start: Date, through end: Date) -> [CostChartPoint] {
+        guard start <= end else { return [] }
+        var prior = ledgerHistory.last(where: { $0.date <= start })?.snapshot ?? LedgerSnapshot()
+        let events = ledgerHistory.filter { $0.date > start && $0.date <= end }
         var result: [CostChartPoint] = []
         var segment = 0
         func add(_ date: Date, _ cost: Decimal?) {

@@ -106,7 +106,7 @@ func previousCNYOnlyBytes() throws -> Data {
     let old = try #require(JSONSerialization.jsonObject(with: original) as? [String: Any])
     let oldRows = try #require(old["entries"] as? [[String: Any]])
     let converted = try BackupCodec.decode(original)
-    #expect(converted.schemaVersion == 5)
+    #expect(converted.schemaVersion == BackupDocument.currentSchemaVersion)
     #expect(converted.baseCurrency == "USD")
     #expect(converted.lastPrice == nil)
     #expect(converted.accounts == Account.defaults)

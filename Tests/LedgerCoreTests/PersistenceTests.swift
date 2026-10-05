@@ -191,10 +191,10 @@ func firstV2SavePreservesOriginalBytesBeforeUpgradingToV5() throws {
     try original.write(to: url)
     let repository = try LedgerRepository(url: url)
     let migrated = try repository.load()
-    #expect(migrated.schemaVersion == 5)
+    #expect(migrated.schemaVersion == BackupDocument.currentSchemaVersion)
     #expect(try Data(contentsOf: url) == original)
     try repository.save(migrated)
-    #expect(try BackupCodec.schemaVersion(in: Data(contentsOf: url)) == 5)
+    #expect(try BackupCodec.schemaVersion(in: Data(contentsOf: url)) == BackupDocument.currentSchemaVersion)
     let preserved = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         .filter { $0.lastPathComponent.hasPrefix("ledger.before-upgrade-v2-") }
     #expect(preserved.count == 1)
@@ -224,4 +224,124 @@ func staleV2MigrationDoesNotOverwriteNewFileOrMakeExtraUpgradeBackups() throws {
     #expect(try Data(contentsOf: url) == latestBytes)
     let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
     #expect(names.filter { $0.hasPrefix("ledger.before-upgrade-v2-") }.count == 1)
+}
+
+@Test @MainActor
+func failedInitialSaveDoesNotPublishABaselineAndCanRetryWithoutReloading() throws {
+    let url = temporaryLedgerURL()
+    let directory = url.deletingLastPathComponent()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    // A file at the directory path deterministically prevents any ledger write.
+    try Data("synthetic obstruction".utf8).write(to: directory)
+    let repository = try LedgerRepository(url: url)
+    let document = BackupDocument(exportedAt: Date(timeIntervalSince1970: 1000))
+    #expect(throws: (any Error).self) { try repository.save(document) }
+    #expect(repository.lastMigrationBackupURL == nil && !repository.needsMigration)
+    try FileManager.default.removeItem(at: directory)
+    try repository.save(document)
+    #expect(try BackupCodec.decode(Data(contentsOf: url)) == document)
+    #expect(try repository.load() == document)
+}
+
+@Test @MainActor
+func failedSavedBaselineWriteCanRetryWithoutAdoptingTheUnwrittenCandidate() throws {
+    let url = temporaryLedgerURL()
+    let directory = url.deletingLastPathComponent()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try LedgerRepository(url: url)
+    let original = BackupDocument(exportedAt: Date(timeIntervalSince1970: 1000))
+    let next = BackupDocument(exportedAt: Date(timeIntervalSince1970: 2000))
+    try repository.save(original)
+    let bytes = try Data(contentsOf: url)
+    let previousURL = try #require(repository.previousURL)
+    try FileManager.default.createDirectory(at: previousURL, withIntermediateDirectories: false)
+    #expect(throws: (any Error).self) { try repository.save(next) }
+    #expect(try Data(contentsOf: url) == bytes)
+    try FileManager.default.removeItem(at: previousURL)
+    // No load intervenes: save must still compare against the original bytes.
+    try repository.save(next)
+    #expect(try Data(contentsOf: previousURL) == bytes)
+    #expect(try repository.load() == next)
+}
+
+@Test(arguments: [1, 6, BackupDocument.currentSchemaVersion]) @MainActor
+func failedLoadedSaveKeepsOriginalSchemaMetadataUntilACompletedRetry(version: Int) throws {
+    let url = temporaryLedgerURL()
+    let directory = url.deletingLastPathComponent()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let original: Data
+    if version == 1 { original = legacyV1Bytes() }
+    else {
+        var object = try #require(JSONSerialization.jsonObject(with: BackupCodec.encode(
+            BackupDocument(exportedAt: Date(timeIntervalSince1970: 1000)))) as? [String: Any])
+        object["schemaVersion"] = version
+        original = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted])
+    }
+    try original.write(to: url)
+    let repository = try LedgerRepository(url: url)
+    var migrated = try repository.load()
+    let shouldUpgrade = version < BackupDocument.currentSchemaVersion
+    #expect(repository.needsMigration == shouldUpgrade)
+    let previousURL = try #require(repository.previousURL)
+    try FileManager.default.createDirectory(at: previousURL, withIntermediateDirectories: false)
+    migrated.exportedAt = Date(timeIntervalSince1970: 2000)
+    #expect(throws: (any Error).self) { try repository.save(migrated) }
+    #expect(try Data(contentsOf: url) == original)
+    #expect(repository.needsMigration == shouldUpgrade && repository.lastMigrationBackupURL == nil)
+    try FileManager.default.removeItem(at: previousURL)
+    try repository.save(migrated)
+    #expect(!repository.needsMigration)
+    #expect(try Data(contentsOf: previousURL) == original)
+    if shouldUpgrade {
+        let backup = try #require(repository.lastMigrationBackupURL)
+        #expect(backup.lastPathComponent.hasPrefix("ledger.before-upgrade-v\(version)-"))
+        #expect(try Data(contentsOf: backup) == original)
+    } else { #expect(repository.lastMigrationBackupURL == nil) }
+    let backupsBefore = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        .filter { $0.hasPrefix("ledger.before-upgrade-") }
+    try repository.save(migrated)
+    let backupsAfter = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        .filter { $0.hasPrefix("ledger.before-upgrade-") }
+    #expect(Set(backupsAfter) == Set(backupsBefore))
+}
+
+@Test @MainActor
+func failedReloadClearsValidatedSchemaBeforeCorruptRecovery() throws {
+    let url = temporaryLedgerURL()
+    let directory = url.deletingLastPathComponent()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try LedgerRepository(url: url)
+    let original = BackupDocument(exportedAt: Date(timeIntervalSince1970: 1000))
+    try repository.save(original)
+    _ = try repository.load()
+    let corrupt = Data("{synthetic corrupt baseline".utf8)
+    try corrupt.write(to: url, options: .atomic)
+    #expect(throws: (any Error).self) { try repository.load() }
+    #expect(throws: RepositoryError.self) { try repository.save(original) }
+    #expect(try Data(contentsOf: url) == corrupt)
+    var invalid = original
+    invalid.schemaVersion = BackupDocument.currentSchemaVersion + 1
+    #expect(throws: (any Error).self) { try repository.save(invalid, replacingCorruptStore: true) }
+    #expect(try Data(contentsOf: url) == corrupt)
+    try repository.save(original, replacingCorruptStore: true)
+    #expect(try repository.load() == original)
+    let preserved = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        .filter { $0.lastPathComponent.hasPrefix("ledger.corrupt-") }
+    #expect(preserved.count == 1)
+    #expect(try Data(contentsOf: #require(preserved.first)) == corrupt)
+}
+
+@Test @MainActor
+func failedInMemorySaveKeepsTheLastValidatedSerializedSnapshot() throws {
+    let repository = try LedgerRepository(inMemory: true)
+    let original = BackupDocument(exportedAt: Date(timeIntervalSince1970: 1000))
+    try repository.save(original)
+    var invalid = original
+    invalid.accounts.append(invalid.accounts[0])
+    #expect(throws: (any Error).self) { try repository.save(invalid) }
+    #expect(try repository.load() == original)
+    let next = BackupDocument(exportedAt: Date(timeIntervalSince1970: 2000))
+    try repository.save(next)
+    #expect(try repository.load() == next && !repository.needsMigration)
 }

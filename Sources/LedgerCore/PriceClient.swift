@@ -78,7 +78,12 @@ public struct PriceClient: Sendable {
         let (data, response) = try await session.data(for: request)
         try Task.checkCancellation()
         guard let response = response as? HTTPURLResponse else { throw PriceError.invalidResponse }
-        guard (200...299).contains(response.statusCode) else { throw PriceError.httpStatus(response.statusCode) }
+        guard (200...299).contains(response.statusCode) else {
+            if let retryAt = HTTPRetryError.retryAfter(response.value(forHTTPHeaderField: "Retry-After"), now: Date()) {
+                throw HTTPRetryError(statusCode: response.statusCode, retryAfter: retryAt)
+            }
+            throw PriceError.httpStatus(response.statusCode)
+        }
         return try Self.decode(data: data, fetchedAt: Date())
     }
 

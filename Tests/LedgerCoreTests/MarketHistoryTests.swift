@@ -273,6 +273,48 @@ private final class HistoryFailureProtocol: URLProtocol, @unchecked Sendable {
     #expect(history.latestClose(asOf: loss.date) == nil)
 }
 
+@Test func sharedLedgerReplayPreservesInclusiveCutoffAndZeroHoldingGaps() throws {
+    let exchange = Account(name: "欧易")
+    let wallet = Account(name: "自有钱包")
+    let firstDate = marketTestNow.addingTimeInterval(-10_800)
+    let lossDate = firstDate.addingTimeInterval(3600)
+    let rebuyDate = lossDate.addingTimeInterval(3600)
+    let first = syntheticEntry(date: firstDate, sequence: 1, kind: .buy, toAccountID: exchange.id,
+                              amountSats: 1_000_000, amountCNY: 1000)
+    let sameInstant = syntheticEntry(date: firstDate, sequence: 2, kind: .buy, toAccountID: exchange.id,
+                                    amountSats: 1_000_000, amountCNY: 2000)
+    let exhausted = syntheticEntry(date: lossDate, sequence: 3, kind: .transfer,
+                                  fromAccountID: exchange.id, toAccountID: wallet.id,
+                                  amountSats: 2_000_000, receivedSats: 0)
+    let rebuy = syntheticEntry(date: rebuyDate, sequence: 4, kind: .buy, toAccountID: exchange.id,
+                              amountSats: 1_000_000, amountCNY: 500)
+    let future = syntheticEntry(date: rebuyDate.addingTimeInterval(1), sequence: 5, kind: .buy,
+                               toAccountID: exchange.id, amountSats: 1_000_000, amountCNY: 500)
+    let accounts = [exchange, wallet]
+    let entries = [future, rebuy, exhausted, sameInstant, first]
+    let replay = try LedgerEngine.history(accounts: accounts, entries: entries)
+    let costs = LedgerChartHistory.costPoints(ledgerHistory: replay, from: firstDate, through: rebuyDate)
+    #expect(costs == (try LedgerChartHistory.costPoints(accounts: accounts, entries: entries,
+                                                       from: firstDate, through: rebuyDate)))
+    #expect(costs.map(\.costUSD) == [150_000, 150_000, 350_000, 350_000])
+    #expect(costs.map(\.segment) == [0, 0, 1, 1])
+    #expect(!costs.contains { $0.date > rebuyDate })
+    #expect(LedgerChartHistory.costPoints(ledgerHistory: replay, from: firstDate, through: firstDate)
+        .map(\.costUSD) == [150_000, 150_000])
+    #expect(LedgerChartHistory.costPoints(ledgerHistory: replay, from: firstDate.addingTimeInterval(-1),
+                                        through: firstDate.addingTimeInterval(-1)).isEmpty)
+    #expect(LedgerChartHistory.costPoints(ledgerHistory: replay, from: rebuyDate, through: firstDate).isEmpty)
+    let candle = MarketCandle(closeDate: marketTestNow, interval: 14_400,
+                             open: 100_000, high: 120_000, low: 90_000, close: 110_000)
+    let market = MarketHistory(range: .day, fetchedAt: marketTestNow, candles: [candle])
+    let events = LedgerChartHistory.events(entries: entries, ledgerHistory: replay, history: market,
+                                          from: firstDate, through: rebuyDate)
+    #expect(events == (try LedgerChartHistory.events(accounts: accounts, entries: entries, history: market,
+                                                     from: firstDate, through: rebuyDate)))
+    #expect(events.map(\.id) == [first.id, sameInstant.id, exhausted.id, rebuy.id])
+    #expect(events.map(\.markerPriceUSD) == [100_000, 150_000, 150_000, 350_000])
+}
+
 private final class EarlyFailureWithValidYahooProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }

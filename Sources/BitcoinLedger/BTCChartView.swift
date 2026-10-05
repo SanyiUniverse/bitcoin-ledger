@@ -1,6 +1,7 @@
 import SwiftUI
 import Charts
 import LedgerCore
+import AppKit
 
 struct BTCChartLoad: Equatable, Hashable, Sendable {
     let period: MarketPeriod
@@ -44,12 +45,30 @@ struct BTCMarketCacheRecord: Codable {
     }
 }
 
+struct BTCChartRetry: Equatable {
+    let id = UUID()
+    let deadline: Date
+    let reason: String
+    func message(now: Date) -> String {
+        let seconds = max(0, Int(deadline.timeIntervalSince(now).rounded(.up)))
+        let text = reason.replacingOccurrences(of: "请稍后手动刷新；", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "。；"))
+        return seconds > 0 ? "\(text)；\(seconds) 秒后自动重试。" : "\(text)；正在自动重试…"
+    }
+}
+
+private enum BTCChartRequestKey: Equatable {
+    case latest(MarketPeriod, MarketRange)
+    case fixed(BTCChartLoad)
+}
+
 @MainActor
 final class BTCChartModel: ObservableObject {
     @Published var history: MarketHistory? { didSet { historyRevision += 1 } }
     private(set) var historyRevision = 0
     @Published var loading = false
     @Published var error: String?
+    @Published private(set) var retry: BTCChartRetry?
     @Published private(set) var rejected: BTCChartLoad?
     private(set) var displayedWindow: BTCChartViewport?
     private(set) var coverageWindow: BTCChartViewport?
@@ -58,21 +77,35 @@ final class BTCChartModel: ObservableObject {
     private var lastPeriodAttempt: [MarketPeriod: Date] = [:]
     private var requested: BTCChartLoad?
     private var requestRevision = 0
+    private var selectionRevision = 0
+    private var requestKey: BTCChartRequestKey?
+    private var latestRange: MarketRange?
+    private var requestedForce = false
+    private var suspended = false
+    private var retryTask: Task<Void, Never>?
     private var activeLoad: BTCChartLoad?
     private var fetchTask: Task<(MarketHistory, BTCChartViewport, Int?), Error>?
     private var nextRequestAt = Date.distantPast
-    private var rateLimitFailures = 0
+    private var failures = 0
     private var displayedRecord: BTCMarketCacheRecord?
     private let cacheDirectory: URL?
     private let client: MarketHistoryClient
+    private let now: @Sendable () -> Date
+    private let sleepUntil: @Sendable (Date) async throws -> Void
 
     static func fileName(period: MarketPeriod) -> String {
         if !period.isIntraday { return "market-history-daily-usd-v1.json" }
         if period == .minute { return "market-history-minute-usd-v1.json" }
         return "market-history-intraday-\(period.rawValue)-usd-v1.json"
     }
-    init(cacheDirectory: URL? = nil, client: MarketHistoryClient = MarketHistoryClient()) {
+    init(cacheDirectory: URL? = nil, client: MarketHistoryClient = MarketHistoryClient(),
+         now: @escaping @Sendable () -> Date = { Date() },
+         sleepUntil: @escaping @Sendable (Date) async throws -> Void = { deadline in
+             try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow)))
+         }) {
         self.client = client
+        self.now = now
+        self.sleepUntil = sleepUntil
         if let cacheDirectory {
             self.cacheDirectory = cacheDirectory
         } else if let path = ProcessInfo.processInfo.environment["BITCOIN_LEDGER_DATA_PATH"] {
@@ -96,6 +129,10 @@ final class BTCChartModel: ObservableObject {
                 cached[period] = record; lastPeriodAttempt[period] = itemFetchedAt(record)
             } catch { self.error = "本地美元 K 线缓存无法读取，将重新请求行情。" }
         }
+    }
+    deinit {
+        retryTask?.cancel()
+        fetchTask?.cancel()
     }
     private func itemFetchedAt(_ record: BTCMarketCacheRecord) -> Date { record.history.fetchedAt }
     private func valid(_ record: BTCMarketCacheRecord) -> Bool {
@@ -134,38 +171,114 @@ final class BTCChartModel: ObservableObject {
     func matchingHistory(period: MarketPeriod, window: BTCChartViewport) -> MarketHistory? {
         matchingHistory(for: BTCChartLoad(period: period, window: window))
     }
-    func load(period: MarketPeriod = .day, window: BTCChartViewport, force: Bool = false) async {
+    func load(period: MarketPeriod = .day, window: BTCChartViewport, force: Bool = false,
+              latestRange: MarketRange? = nil) async {
         guard !Task.isCancelled else { return }
         let load = BTCChartLoad(period: period, window: window)
         requestRevision += 1
-        let revision = requestRevision
+        let key = latestRange.map { BTCChartRequestKey.latest(period, $0) } ?? .fixed(load)
+        if requestKey != key {
+            selectionRevision += 1
+            retryTask?.cancel(); retryTask = nil; retry = nil
+            fetchTask?.cancel()
+            failures = 0; requestedForce = false
+            requestKey = key
+        }
+        suspended = false
+        self.latestRange = latestRange
         requested = load
-        if loading, activeLoad != load { fetchTask?.cancel() }
+        requestedForce = requestedForce || force
+        guard !loading else { return }
+        await attemptCurrentRequest()
+    }
+    private func allowedAt(for load: BTCChartLoad) -> Date {
+        max(nextRequestAt, (lastAttempt[load] ?? .distantPast).addingTimeInterval(60),
+            requestedForce ? (lastPeriodAttempt[load.sourcePeriod] ?? .distantPast).addingTimeInterval(60) : .distantPast,
+            retry?.deadline ?? .distantPast)
+    }
+    private func clearRetry() {
+        retryTask?.cancel(); retryTask = nil; retry = nil
+    }
+    private func scheduleRetry(at deadline: Date, reason: String) {
+        guard requested != nil, !suspended else { return }
+        if retry?.deadline == deadline, retry?.reason == reason, retryTask != nil { return }
+        retryTask?.cancel()
+        requestedForce = true
+        let pending = BTCChartRetry(deadline: deadline, reason: reason)
+        retry = pending
+        let revision = selectionRevision
+        let now = now, sleepUntil = sleepUntil
+        retryTask = Task { [weak self] in
+            do {
+                while now() < deadline {
+                    try Task.checkCancellation()
+                    try await sleepUntil(deadline)
+                }
+                try Task.checkCancellation()
+            } catch { return }
+            guard let self, !self.suspended, self.selectionRevision == revision,
+                  self.retry?.id == pending.id, self.requested != nil else { return }
+            self.retryTask = nil
+            await self.attemptCurrentRequest()
+        }
+    }
+    func pauseForSleep() {
+        suspended = true
+        retryTask?.cancel(); retryTask = nil
+        if loading { requestedForce = true }
+        fetchTask?.cancel()
+    }
+    func resume() {
+        let wasSuspended = suspended
+        suspended = false
+        guard requested != nil else { return }
+        if let pending = retry {
+            scheduleRetry(at: pending.deadline, reason: pending.reason)
+        } else if wasSuspended, requestedForce, !loading {
+            Task { await attemptCurrentRequest() }
+        }
+    }
+    func stop() {
+        suspended = true; selectionRevision += 1
+        requested = nil; requestKey = nil; latestRange = nil; requestedForce = false
+        clearRetry(); fetchTask?.cancel()
+    }
+    private func attemptCurrentRequest() async {
+        guard !loading, !suspended, var load = requested, !Task.isCancelled else { return }
+        let revision = selectionRevision
+        let callRevision = requestRevision
+        if let latestRange {
+            let date = now()
+            load = BTCChartLoad(period: load.period,
+                window: BTCChartViewport(start: latestRange.startDate(today: date), end: date))
+            requested = load
+        }
+        let window = load.window
         let sourcePeriod = load.sourcePeriod
-        do { try load.validate() } catch {
+        do { try load.validate(now: now()) } catch {
+            clearRetry(); requestedForce = false
             rejected = load; self.error = error.localizedDescription
             return
         }
         if let previous = cached[sourcePeriod], previous.covers(load) {
             publish(previous, for: load)
-            if !force, Date().timeIntervalSince(previous.history.fetchedAt) < (sourcePeriod.isIntraday ? 60 : 14400) { return }
+            if !requestedForce, now().timeIntervalSince(previous.history.fetchedAt) < (sourcePeriod.isIntraday ? 60 : 14400) {
+                clearRetry(); return
+            }
         }
-        guard !loading else { return }
-        let allowedAt = max(nextRequestAt, (lastAttempt[load] ?? .distantPast).addingTimeInterval(60),
-                            force ? (lastPeriodAttempt[sourcePeriod] ?? .distantPast).addingTimeInterval(60) : .distantPast)
-        guard Date() >= allowedAt else {
-            let wait = max(1, Int(allowedAt.timeIntervalSinceNow.rounded(.up)))
-            error = matchingHistory(for: load) == nil
-                ? "所选范围行情暂不可请求；\(wait) 秒后可手动刷新。"
-                : "行情暂时使用缓存；\(wait) 秒后可手动刷新。"
+        let deadline = allowedAt(for: load)
+        guard now() >= deadline else {
+            scheduleRetry(at: deadline, reason: retry?.reason ?? (matchingHistory(for: load) == nil
+                ? "所选范围行情暂不可请求" : "行情暂时使用缓存"))
             return
         }
-        if lastAttempt.count > 48 { lastAttempt = lastAttempt.filter { Date().timeIntervalSince($0.value) < 60 } }
+        clearRetry()
+        if lastAttempt.count > 48 { lastAttempt = lastAttempt.filter { now().timeIntervalSince($0.value) < 60 } }
         loading = true; rejected = nil; error = matchingHistory(for: load)?.warning
         let previousAttempt = lastAttempt[load]
         let previousPeriodAttempt = lastPeriodAttempt[sourcePeriod]
-        lastAttempt[load] = Date(); lastPeriodAttempt[sourcePeriod] = Date()
-        var retryRepeatedRequest = false
+        lastAttempt[load] = now(); lastPeriodAttempt[sourcePeriod] = now()
+        var restartCurrentRequest = false
         do {
             activeLoad = load
             let work = Task { [client] () throws -> (MarketHistory, BTCChartViewport, Int?) in
@@ -203,7 +316,8 @@ final class BTCChartModel: ObservableObject {
             let record = BTCMarketCacheRecord(period: sourcePeriod, from: expected.start, through: expected.end,
                                               history: displayHistory, nativeGranularity: nativeGranularity)
             guard valid(record) else { throw MarketHistoryError.invalidResponse }
-            cached[sourcePeriod] = record; rateLimitFailures = 0
+            guard selectionRevision == revision, !suspended else { throw CancellationError() }
+            cached[sourcePeriod] = record; failures = 0; requestedForce = false
             if let latest = requested, record.covers(latest) { publish(record, for: latest) }
             if let directory = cacheDirectory {
                 do {
@@ -221,23 +335,25 @@ final class BTCChartModel: ObservableObject {
                 lastAttempt[load] = previousAttempt; lastPeriodAttempt[sourcePeriod] = previousPeriodAttempt
                 // A → B → A can return to the original load while its first
                 // fetch is still cancelling. That newer A must not be lost.
-                retryRepeatedRequest = requested == load && requestRevision > revision
+                restartCurrentRequest = requested != nil && (requestRevision > callRevision || requestedForce)
             } else {
-                if error as? MarketHistoryError == .httpStatus(429) {
-                    rateLimitFailures += 1
-                    nextRequestAt = Date().addingTimeInterval(min(900, 60 * pow(2, Double(rateLimitFailures))))
-                }
-                if requested == load {
+                if selectionRevision == revision, requested != nil, !suspended {
                     rejected = load; self.error = error.localizedDescription
+                    failures += 1
+                    if let retryAt = MarketRetryPolicy.deadline(for: error, failureCount: failures, now: now()) {
+                        if error as? MarketHistoryError == .httpStatus(429) || (error as? HTTPRetryError)?.statusCode == 429 {
+                            nextRequestAt = retryAt
+                        }
+                        scheduleRetry(at: max(retryAt, allowedAt(for: load)), reason: error.localizedDescription)
+                    } else {
+                        clearRetry(); requestedForce = false
+                    }
                 }
             }
         }
         fetchTask = nil; activeLoad = nil; loading = false
-        if let pending = requested, pending != load || retryRepeatedRequest {
-            Task {
-                guard self.requested == pending else { return }
-                await self.load(period: pending.period, window: pending.window)
-            }
+        if requested != nil, !suspended, selectionRevision != revision || restartCurrentRequest {
+            Task { await attemptCurrentRequest() }
         }
     }
 }
@@ -438,10 +554,14 @@ final class BTCPlotCache: ObservableObject {
             $0.hasOHLC ? $0.closeDate > incoming.window.start && $0.startDate < incoming.window.end
                 : $0.closeDate >= incoming.window.start && $0.closeDate <= incoming.window.end
         }
-        let costs = (try? LedgerChartHistory.costPoints(accounts: incoming.accounts, entries: incoming.entries,
-            from: incoming.window.start, through: incoming.window.end)) ?? []
-        let events = ((try? LedgerChartHistory.events(accounts: incoming.accounts, entries: incoming.entries,
-            history: history, from: incoming.window.start, through: incoming.window.end)) ?? []).map {
+        let ledgerHistory = try? LedgerEngine.history(accounts: incoming.accounts, entries: incoming.entries)
+        let costs = ledgerHistory.map {
+            LedgerChartHistory.costPoints(ledgerHistory: $0, from: incoming.window.start, through: incoming.window.end)
+        } ?? []
+        let events = (ledgerHistory.map {
+            LedgerChartHistory.events(entries: incoming.entries, ledgerHistory: $0,
+                history: history, from: incoming.window.start, through: incoming.window.end)
+        } ?? []).map {
                 ChartEvent(entry: $0.entry, y: NSDecimalNumber(decimal: $0.markerPriceUSD).doubleValue)
             }
         // Automatic pricing fits the observations after every time navigation.
@@ -707,7 +827,12 @@ struct BTCChartView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, minHeight: 60, maxHeight: .infinity)
             }
-            if let error = model.error {
+            if let retry = model.retry {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(retry.message(now: context.date)).font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else if let error = model.error {
                 Text(error).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -718,7 +843,8 @@ struct BTCChartView: View {
                 do { try await Task.sleep(for: .milliseconds(400)) } catch { return }
             }
             guard !Task.isCancelled else { return }
-            await model.load(period: period, window: desiredWindow)
+            await model.load(period: period, window: desiredWindow,
+                             latestRange: !useCustomRange && viewport == nil ? range : nil)
         }
         .task(id: inspectionActivity) {
             guard selectedDate != nil else { return }
@@ -734,7 +860,10 @@ struct BTCChartView: View {
             let observationTime = min(history.fetchedAt, Date())
             if observationTime > today { today = observationTime }
         }
-        .onDisappear { dismissDetails() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)) { _ in model.pauseForSleep() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in model.resume() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.resume() }
+        .onDisappear { dismissDetails(); model.stop() }
     }
     private var title: some View { Text("BTC 美元 K 线").font(.headline) }
     private var controls: some View {
@@ -805,7 +934,8 @@ struct BTCChartView: View {
             }.help(expandedChart ? "收起图幅" : "展开图幅").accessibilityLabel(expandedChart ? "收起图幅" : "展开图幅")
             Button {
                 resetPriceScale(); today = Date(); dismissDetails()
-                Task { await model.load(period: period, window: desiredWindow, force: true) }
+                Task { await model.load(period: period, window: desiredWindow, force: true,
+                                        latestRange: !useCustomRange && viewport == nil ? range : nil) }
             } label: {
                 if model.loading { ProgressView().controlSize(.small) }
                 else { Image(systemName: "arrow.clockwise") }

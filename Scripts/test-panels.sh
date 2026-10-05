@@ -7,7 +7,7 @@ QA_ROOT="$QA_STAGE/work/panel-qa"
 QA_PACKAGE="$QA_ROOT/harness"
 mkdir -p "$QA_PACKAGE/Sources/LedgerCore" "$QA_PACKAGE/Sources/PanelQA"
 cp "$PROJECT_DIR"/Sources/LedgerCore/*.swift "$QA_PACKAGE/Sources/LedgerCore/"
-for source in AppStore ContentView DetailViews Editors PanelPresentation BTCChartView BTCChartInput; do
+for source in AppStore ContentView DetailViews Editors PanelPresentation BTCChartView BTCChartInput DailyProfitView; do
     cp "$PROJECT_DIR/Sources/BitcoinLedger/$source.swift" "$QA_PACKAGE/Sources/PanelQA/"
 done
 cp "$PROJECT_DIR"/Tests/NativePanelChecks/*.swift "$QA_PACKAGE/Sources/PanelQA/"

@@ -27,6 +27,7 @@ public final class LedgerRepository {
     public private(set) var lastMigrationBackupURL: URL?
     private var memoryDocument = BackupDocument()
     private var lastReadData: Data?
+    private var lastReadSchemaVersion: Int?
     private var hasLoaded = false
 
     public init(url: URL? = nil, inMemory: Bool = false) throws {
@@ -50,10 +51,13 @@ public final class LedgerRepository {
         // Even an invalid file establishes a conflict baseline. A recovery must
         // not overwrite a different file that appeared after this failed load.
         lastReadData = raw
+        lastReadSchemaVersion = nil
         hasLoaded = true
         do {
-            memoryDocument = try raw.map { try BackupCodec.decode($0) } ?? BackupDocument()
-            needsMigration = try raw.map { try BackupCodec.schemaVersion(in: $0) < BackupDocument.currentSchemaVersion } ?? false
+            let decoded = try raw.map { try BackupCodec.decodeWithSourceVersion($0) }
+            memoryDocument = decoded?.document ?? BackupDocument()
+            lastReadSchemaVersion = decoded?.sourceVersion
+            needsMigration = decoded.map { $0.sourceVersion < BackupDocument.currentSchemaVersion } ?? false
         } catch {
             throw RepositoryError.unreadableStore(error.localizedDescription)
         }
@@ -68,20 +72,25 @@ public final class LedgerRepository {
         let data = try BackupCodec.encode(document)
         // Validate the precise serialized representation before touching disk.
         let validated = try BackupCodec.decode(data)
-        guard let url else { memoryDocument = validated; needsMigration = false; return }
+        guard let url else { rememberSaved(validated, data: data); return }
         let manager = FileManager.default
         let directory = url.deletingLastPathComponent()
         try manager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
 
+        var migrationBackupURL: URL?
         try coordinated(url: url, writing: true) { coordinatedURL in
             let current = manager.fileExists(atPath: coordinatedURL.path) ? try Data(contentsOf: coordinatedURL) : nil
             if hasLoaded, current != lastReadData { throw RepositoryError.changedOnDisk }
             if !hasLoaded, current != nil { throw RepositoryError.changedOnDisk }
 
             if let current {
+                let originalVersion: Int
                 do {
-                    _ = try BackupCodec.decode(current)
+                    // The conflict check above proves these are precisely the
+                    // baseline bytes. Unknown or failed-load bytes are never trusted.
+                    originalVersion = try lastReadSchemaVersion
+                        ?? BackupCodec.decodeWithSourceVersion(current).sourceVersion
                 } catch {
                     guard replacingCorruptStore else { throw RepositoryError.unreadableStore(error.localizedDescription) }
                     let preserved = directory.appendingPathComponent("ledger.corrupt-\(UUID().uuidString).json")
@@ -89,11 +98,10 @@ public final class LedgerRepository {
                     try writePrivate(data, to: coordinatedURL)
                     return
                 }
-                let originalVersion = try BackupCodec.schemaVersion(in: current)
                 if originalVersion < BackupDocument.currentSchemaVersion {
                     let preserved = directory.appendingPathComponent("ledger.before-upgrade-v\(originalVersion)-\(UUID().uuidString).json")
                     try writePrivate(current, to: preserved)
-                    lastMigrationBackupURL = preserved
+                    migrationBackupURL = preserved
                 }
                 if preserveCurrent {
                     let preserved = directory.appendingPathComponent("ledger.before-import-\(UUID().uuidString).json")
@@ -104,8 +112,14 @@ public final class LedgerRepository {
             }
             try writePrivate(data, to: coordinatedURL)
         }
-        memoryDocument = validated
+        if let migrationBackupURL { lastMigrationBackupURL = migrationBackupURL }
+        rememberSaved(validated, data: data)
+    }
+
+    private func rememberSaved(_ document: BackupDocument, data: Data) {
+        memoryDocument = document
         lastReadData = data
+        lastReadSchemaVersion = document.schemaVersion
         hasLoaded = true
         needsMigration = false
     }

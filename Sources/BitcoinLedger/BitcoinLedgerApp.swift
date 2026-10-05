@@ -10,16 +10,12 @@ struct BitcoinLedgerApp: App {
         Window("Bitcoin Ledger", id: "main") {
             ContentView().environmentObject(store)
                 .frame(minWidth: 600, minHeight: 420)
-                .task {
-                    await store.refreshPrice()
-                    while !Task.isCancelled {
-                        try? await Task.sleep(for: .seconds(300))
-                        guard !Task.isCancelled else { break }
-                        await store.refreshPrice()
-                    }
-                }
+                .task { await store.runServices() }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                    Task { await store.refreshPrice() }
+                    Task { await store.servicesDidBecomeActive() }
+                }
+                .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in
+                    Task { await store.servicesDidBecomeActive() }
                 }
         }
         .defaultSize(width: 1100, height: 800)

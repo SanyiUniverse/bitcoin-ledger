@@ -45,7 +45,7 @@ func legacyV2Bytes() -> Data { try! legacyBytes(version: 2, entries: [legacyReco
 
 @Test func migrationV1RetainsCashNetBTCDateIDAndAccountIDs() throws {
     let document = try BackupCodec.decode(legacyV1Bytes())
-    #expect(document.schemaVersion == 5)
+    #expect(document.schemaVersion == BackupDocument.currentSchemaVersion)
     #expect(document.accounts.map(\.id) == [oldExchange, oldWallet])
     #expect(document.accounts.map(\.name) == ["欧易", "自有钱包"])
     #expect(document.entries[0].date == Date(timeIntervalSince1970: (legacyTime + 1_000) / 1_000))

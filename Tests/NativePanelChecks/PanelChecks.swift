@@ -303,6 +303,7 @@ struct ChartSizeScene: View {
         try checkChartResizeState(store: store)
         try checkChartCombinationMatrix(store: store)
         try checkChartRequestSwitching()
+        try checkChartAutomaticRetry()
         checkNativeInputGestureBoundaries()
         for kind in EntryKind.allCases {
             let window = host(ProbeScene(probe: PanelProbe(), panel: LedgerPanel(destination: .entry(kind, nil))), store: store, size: NSSize(width: 800, height: 650))
@@ -322,6 +323,9 @@ struct ChartSizeScene: View {
         checkMetricOrdering()
         checkCurrencySaving(store: store, rates: rates, buy: buy, transfer: transfer)
         record(QAOfflineProtocol.attempts.count == 0, "fresh synthetic market cache renders chart without any network attempt")
+        try checkDailyProfitUI()
+        try checkDailyStoreScheduling()
+        try checkSidebarOrdering()
         report.append("\(report.filter { $0.hasPrefix("PASS ") }.count) panel checks passed.")
         report.append("Only harness-owned NSWindows receive local native callbacks and key-equivalent events; fixture data is synthetic and isolated.")
         print(report.filter { $0.hasPrefix("BUTTON ") || $0.hasPrefix("POPUP ") || $0.hasPrefix("SCOPE ") }.joined(separator: "\n"))

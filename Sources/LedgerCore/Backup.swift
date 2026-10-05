@@ -24,7 +24,7 @@ public struct MigrationReport: Codable, Equatable, Sendable {
 }
 
 public struct BackupDocument: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 5
+    public static let currentSchemaVersion = 7
     public static let supportedAccountingPolicy = "usd-invested-net-btc-v1"
     public var schemaVersion: Int
     public var baseCurrency: String
@@ -34,12 +34,14 @@ public struct BackupDocument: Codable, Equatable, Sendable {
     public var entries: [LedgerEntry]
     public var lastPrice: PriceQuote?
     public var migrationReport: MigrationReport?
+    public var dailyNoonObservations: [DailyNoonObservation]
 
     public init(schemaVersion: Int = Self.currentSchemaVersion, exportedAt: Date = Date(),
                 accounts: [Account] = Account.defaults, entries: [LedgerEntry] = [],
                 lastPrice: PriceQuote? = nil, baseCurrency: String = "USD",
                 accountingPolicy: String = Self.supportedAccountingPolicy,
-                migrationReport: MigrationReport? = nil) {
+                migrationReport: MigrationReport? = nil,
+                dailyNoonObservations: [DailyNoonObservation] = []) {
         self.schemaVersion = schemaVersion
         self.baseCurrency = baseCurrency
         self.accountingPolicy = accountingPolicy
@@ -48,6 +50,26 @@ public struct BackupDocument: Codable, Equatable, Sendable {
         self.entries = entries
         self.lastPrice = lastPrice
         self.migrationReport = migrationReport
+        self.dailyNoonObservations = dailyNoonObservations
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, baseCurrency, accountingPolicy, exportedAt, accounts, entries
+        case lastPrice, migrationReport, dailyNoonObservations
+    }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
+        baseCurrency = try values.decode(String.self, forKey: .baseCurrency)
+        accountingPolicy = try values.decode(String.self, forKey: .accountingPolicy)
+        exportedAt = try values.decode(Date.self, forKey: .exportedAt)
+        accounts = try values.decode([Account].self, forKey: .accounts)
+        entries = try values.decode([LedgerEntry].self, forKey: .entries)
+        lastPrice = try values.decodeIfPresent(PriceQuote.self, forKey: .lastPrice)
+        migrationReport = try values.decodeIfPresent(MigrationReport.self, forKey: .migrationReport)
+        // Version 5 did not have daily prices. Preserve its full USD ledger.
+        if schemaVersion == 5 { dailyNoonObservations = [] }
+        else { dailyNoonObservations = try values.decode([DailyNoonObservation].self, forKey: .dailyNoonObservations) }
     }
 }
 
@@ -119,12 +141,25 @@ public enum BackupCodec {
     }
 
     public static func decode(_ data: Data) throws -> BackupDocument {
+        try decodeWithSourceVersion(data).document
+    }
+
+    /// The repository retains this original version only alongside the exact
+    /// bytes that were fully decoded and validated here.
+    static func decodeWithSourceVersion(_ data: Data) throws -> (document: BackupDocument, sourceVersion: Int) {
         let version = try schemaVersion(in: data)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .millisecondsSince1970
         do {
             let document: BackupDocument
-            if version == 5 { document = try decoder.decode(BackupDocument.self, from: data) }
+            if version >= 5 {
+                var current = try decoder.decode(BackupDocument.self, from: data)
+                if version == 6, current.dailyNoonObservations.contains(where: { $0.source != DailyProfitEngine.legacyNoonSource }) {
+                    throw BackupError.invalidDocument("旧版每日中午行情来源无效，未丢弃或替换原缓存。")
+                }
+                current.schemaVersion = BackupDocument.currentSchemaVersion
+                document = current
+            }
             else if version == 4 {
                 let old = try decoder.decode(PreviousBTCOnlyDocument.self, from: data)
                 // CNY quotes cannot be relabelled USD. Retain purchase inputs;
@@ -138,7 +173,7 @@ public enum BackupCodec {
                     entries: entries, migrationReport: old.migrationReport)
             } else { document = try migrate(decoder.decode(LegacyDocument.self, from: data)) }
             try validate(document)
-            return document
+            return (document, version)
         } catch let error as BackupError { throw error }
         catch { throw BackupError.invalidDocument("JSON 格式、日期或数值格式不正确。\(error.localizedDescription)") }
     }
@@ -169,6 +204,7 @@ public enum BackupCodec {
                 throw BackupError.invalidDocument("迁移报告无效。")
             }
         }
+        try DailyProfitEngine.validate(document.dailyNoonObservations)
         _ = try LedgerEngine.calculate(accounts: document.accounts, entries: document.entries)
     }
 
@@ -179,20 +215,21 @@ public enum BackupCodec {
 
     public static func csv(accounts: [Account], entries: [LedgerEntry]) throws -> Data {
         _ = try LedgerEngine.calculate(accounts: accounts, entries: entries)
+        let timestamp = timestampFormatter()
         let names = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0.name) })
         var rows = [["id", "date_utc", "sequence", "kind", "from_account_id", "from_account_name",
                      "to_account_id", "to_account_name", "amount_sats", "amount_btc", "received_sats",
                      "received_btc", "amount_cny", "amount_usd", "cny_per_usd", "fx_date_utc", "fx_source", "loss_sats", "loss_btc", "note"]]
         for entry in LedgerEngine.ordered(entries) {
             rows.append([
-                entry.id.uuidString, timestamp(entry.date), String(entry.sequence), entry.kind.rawValue,
+                entry.id.uuidString, timestamp.string(from: entry.date), String(entry.sequence), entry.kind.rawValue,
                 entry.fromAccountID?.uuidString ?? "", safeText(entry.fromAccountID.flatMap { names[$0] } ?? ""),
                 entry.toAccountID?.uuidString ?? "", safeText(entry.toAccountID.flatMap { names[$0] } ?? ""),
                 String(entry.amountSats), Amounts.string(Amounts.btc(entry.amountSats)),
                 String(entry.receivedSats), Amounts.string(Amounts.btc(entry.receivedSats)),
                 Amounts.string(entry.amountCNY), entry.amountUSD.map(Amounts.string) ?? "",
                 entry.conversion.map { Amounts.string($0.rate.cnyPerUSD) } ?? "",
-                entry.conversion.map { timestamp($0.rate.date) } ?? "",
+                entry.conversion.map { timestamp.string(from: $0.rate.date) } ?? "",
                 safeText(entry.conversion?.rate.source ?? ""),
                 String(entry.lossSats), Amounts.string(Amounts.btc(entry.lossSats)), safeText(entry.note)
             ])
@@ -201,11 +238,36 @@ public enum BackupCodec {
         return Data(csv.utf8)
     }
 
-    private static func timestamp(_ date: Date) -> String {
+    /// Separate daily valuation export keeps the existing transaction CSV
+    /// stable. No changing live point is mixed into fixed settlement records.
+    public static func dailyProfitCSV(_ document: BackupDocument, now: Date = Date()) throws -> Data {
+        try validate(document)
+        let timestamp = timestampFormatter()
+        let formatter = DateFormatter()
+        formatter.calendar = DailyProfitEngine.calendar
+        formatter.timeZone = DailyProfitEngine.calendar.timeZone
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        var rows = [["date_shanghai", "settlement_utc", "amount_sats", "amount_btc", "cost_usd",
+                     "market_value_usd", "profit_usd", "profit_ratio", "price_usd", "status",
+                     "source", "fetched_at_utc"]]
+        for row in try DailyProfitEngine.rows(document: document, now: now) {
+            rows.append([formatter.string(from: row.date), timestamp.string(from: row.date), String(row.totalSats),
+                Amounts.string(Amounts.btc(row.totalSats)), row.costUSD.map(Amounts.string) ?? "",
+                row.marketValueUSD.map(Amounts.string) ?? "", row.profitUSD.map(Amounts.string) ?? "",
+                row.profitRatio.map(Amounts.string) ?? "", row.priceUSD.map(Amounts.string) ?? "",
+                row.status.rawValue, safeText(row.observation?.source ?? ""),
+                row.observation.map { timestamp.string(from: $0.fetchedAt) } ?? ""])
+        }
+        let text = "\u{FEFF}" + rows.map { $0.map(escapeCSV).joined(separator: ",") }.joined(separator: "\r\n") + "\r\n"
+        return Data(text.utf8)
+    }
+
+    private static func timestampFormatter() -> ISO8601DateFormatter {
         let formatter = ISO8601DateFormatter()
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        return formatter
     }
     private static func safeText(_ value: String) -> String {
         let first = value.trimmingCharacters(in: .whitespacesAndNewlines).first
